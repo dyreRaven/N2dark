@@ -10,6 +10,7 @@ let wantsJump = false;
 let wantsInteract = false;
 let wantsCraftPickaxe = false;
 let wantsCraftAxe = false;
+let wantsCraftFoundation = false;
 let wantsRespawn = false;
 let inventoryOpen = false;
 let mapOpen = false;
@@ -49,10 +50,12 @@ const remotePlayers = new Map();
 const PLAYER_SPAWN_X = 80;
 const PLAYER_SPAWN_Y = 380;
 const REDWOODS_SPAWN_X = 1180;
+const RANDOM_RESPAWN_JITTER = 96;
 const PLAYER_RESPAWN_SECONDS = 1.5;
 const ZONE_BEACH = "beach";
 const ZONE_REDWOODS = "redwoods";
 const SIGNED_IN_USER_STORAGE_KEY = "ark2d_signed_in_user";
+const GUEST_PROFILE_STORAGE_KEY = "ark2d_guest_profile_v1";
 const GOOGLE_CLIENT_ID = (window.GOOGLE_CLIENT_ID || "").trim();
 const GOOGLE_SIGNIN_RETRY_MS = 140;
 const GOOGLE_SIGNIN_MAX_RETRIES = 36;
@@ -64,9 +67,11 @@ const MENU_HOME = "home";
 const MENU_MODE = "mode";
 const MENU_SINGLEPLAYER = "singleplayer";
 let mainMenuScreen = MENU_HOME;
+let worldListScroll = 0;
 const MULTIPLAYER_LAST_SERVER_KEY = "ark2d_last_multiplayer_server";
 const MULTIPLAYER_SEND_INTERVAL = 0.1;
 const MULTIPLAYER_SAVE_INTERVAL = 3;
+let guestProfile = null;
 
 const inputState = {
   hotbarSlotRects: [],
@@ -78,7 +83,11 @@ const inputState = {
     singleplayerButton: null,
     backButton: null,
     createWorldButton: null,
-    worldButtons: []
+    worldButtons: [],
+    worldDeleteButtons: [],
+    worldListPanel: null,
+    worldScrollUpButton: null,
+    worldScrollDownButton: null
   },
   mapUi: {
     panel: null,
@@ -100,7 +109,8 @@ const inputState = {
     assignButtons: [],
     clearSelectedButton: null,
     craftPickaxeButton: null,
-    craftAxeButton: null
+    craftAxeButton: null,
+    craftFoundationButton: null
   }
 };
 
@@ -115,6 +125,7 @@ const player = {
   health: 100,
   maxHealth: 100,
   regenCooldown: 0,
+  stunTimer: 0,
   dead: false,
   respawnTimer: 0,
   onGround: false,
@@ -134,15 +145,17 @@ const METAL_NODE_HEALTH = 7;
 const METAL_NODE_CHANCE = 0.1;
 const NPC_ATTACK_COOLDOWN = 1;
 const RAPTOR_ATTACK_COOLDOWN = 0.7;
+const THYLACOLEO_POUNCE_STUN_SECONDS = 5;
 const BACKGROUND_MUSIC_FILE = "Spiring - City Life (freetouse.com).mp3";
 const DAMAGE_MUSIC_FILE = "Conquest - Blacksmith (freetouse.com).mp3";
 const DAMAGE_MUSIC_SECONDS = 10;
 const MUSIC_LOOP_DELAY_MS = 5000;
+const ENABLE_IDLE_BACKGROUND_MUSIC = false;
 
 const backgroundMusic = new Audio(BACKGROUND_MUSIC_FILE);
 backgroundMusic.loop = false;
 backgroundMusic.volume = 0.4;
-backgroundMusic.preload = "auto";
+backgroundMusic.preload = ENABLE_IDLE_BACKGROUND_MUSIC ? "auto" : "none";
 const damageMusic = new Audio(DAMAGE_MUSIC_FILE);
 damageMusic.loop = false;
 damageMusic.volume = 0.45;
@@ -178,6 +191,7 @@ function clearDamageLoopTimeout() {
 }
 
 function pauseBackgroundMusic(resetPosition = false) {
+  if (!ENABLE_IDLE_BACKGROUND_MUSIC) return;
   backgroundMusic.pause();
   clearBackgroundLoopTimeout();
   backgroundWaitingForLoop = false;
@@ -204,7 +218,7 @@ function startDamageMusic(restartFromStart = false) {
   } else if (damageMusic.ended) {
     resetAudioPosition(damageMusic);
   }
-  if (!backgroundMusic.paused) {
+  if (ENABLE_IDLE_BACKGROUND_MUSIC && !backgroundMusic.paused) {
     pauseBackgroundMusic(false);
   }
   const playPromise = damageMusic.play();
@@ -236,11 +250,11 @@ function updateDamageMusic(dt) {
 
   if (damageMusicTimer <= 0) {
     pauseDamageMusic(true);
-    tryStartBackgroundMusic();
   }
 }
 
 function tryStartBackgroundMusic() {
+  if (!ENABLE_IDLE_BACKGROUND_MUSIC) return;
   if (!musicEnabled) return;
   if (backgroundWaitingForLoop) return;
   if (damageMusicTimer > 0 || !damageMusic.paused) return;
@@ -275,6 +289,7 @@ function toggleBackgroundMusic() {
 }
 
 backgroundMusic.addEventListener("ended", () => {
+  if (!ENABLE_IDLE_BACKGROUND_MUSIC) return;
   backgroundMusicStarted = false;
   if (!musicEnabled) return;
   if (damageMusicTimer > 0 || !damageMusic.paused) return;
@@ -312,15 +327,21 @@ const platforms = [
   { x: 0, y: 490, w: WORLD_WIDTH, h: 60 }
 ];
 const GROUND_Y = platforms[0].y;
+const FOUNDATION_WIDTH = 72;
+const FOUNDATION_HEIGHT = 14;
+const FOUNDATION_PLACE_OFFSET = 68;
+const FOUNDATION_SNAP = 12;
 
 const inventory = {
   thatch: 0,
+  fiber: 0,
   wood: 0,
   stone: 0,
   flint: 0,
   metal: 0,
-  pickaxe: false,
-  axe: false
+  pickaxe: 0,
+  axe: 0,
+  foundation: 0
 };
 
 const hotbar = {
@@ -345,12 +366,14 @@ function createDefaultWorldData() {
     zone: ZONE_BEACH,
     inventory: {
       thatch: 0,
+      fiber: 0,
       wood: 0,
       stone: 0,
       flint: 0,
       metal: 0,
-      pickaxe: false,
-      axe: false
+      pickaxe: 0,
+      axe: 0,
+      foundation: 0
     },
     hotbar: {
       slots: ["hands", null, null, null, null],
@@ -360,8 +383,23 @@ function createDefaultWorldData() {
     selectedInventoryTool: "hands",
     trees: [],
     stones: [],
-    pebbles: []
+    pebbles: [],
+    bushes: [],
+    foundationsByZone: {
+      [ZONE_BEACH]: [],
+      [ZONE_REDWOODS]: []
+    }
   };
+}
+
+function createNewWorldData() {
+  const data = createDefaultWorldData();
+  const randomLayout = createRandomResourceLayoutData();
+  data.trees = randomLayout.trees;
+  data.stones = randomLayout.stones;
+  data.pebbles = randomLayout.pebbles;
+  data.bushes = randomLayout.bushes;
+  return data;
 }
 
 function normalizeWorldData(data) {
@@ -373,7 +411,7 @@ function normalizeWorldData(data) {
   const normalizedSlots = [];
   for (let i = 0; i < defaults.hotbar.slots.length; i++) {
     const tool = Array.isArray(sourceHotbar.slots) ? sourceHotbar.slots[i] : defaults.hotbar.slots[i];
-    normalizedSlots.push(tool === "hands" || tool === "pickaxe" || tool === "axe" ? tool : null);
+    normalizedSlots.push(tool === "hands" || tool === "pickaxe" || tool === "axe" || tool === "foundation" ? tool : null);
   }
   if (!normalizedSlots.includes("hands")) {
     normalizedSlots[0] = "hands";
@@ -384,12 +422,14 @@ function normalizeWorldData(data) {
     : 0;
 
   const normalizedTrees = Array.isArray(source.trees) ? source.trees.map((treeState) => ({
+    x: Number.isFinite(treeState?.x) ? treeState.x : Number.NaN,
     alive: !treeState || treeState.alive !== false,
     health: Number.isFinite(treeState?.health) ? treeState.health : 0,
     respawnTimer: Number.isFinite(treeState?.respawnTimer) ? Math.max(0, treeState.respawnTimer) : 0
   })) : [];
 
   const normalizedStones = Array.isArray(source.stones) ? source.stones.map((stoneState) => ({
+    x: Number.isFinite(stoneState?.x) ? stoneState.x : Number.NaN,
     alive: !stoneState || stoneState.alive !== false,
     health: Number.isFinite(stoneState?.health) ? stoneState.health : 0,
     respawnTimer: Number.isFinite(stoneState?.respawnTimer) ? Math.max(0, stoneState.respawnTimer) : 0,
@@ -401,28 +441,67 @@ function normalizeWorldData(data) {
     respawnTimer: Number.isFinite(pebbleState?.respawnTimer) ? Math.max(0, pebbleState.respawnTimer) : 0
   })) : [];
 
+  const normalizedBushes = Array.isArray(source.bushes) ? source.bushes.map((bushState) => ({
+    x: Number.isFinite(bushState?.x) ? bushState.x : Number.NaN,
+    alive: !bushState || bushState.alive !== false,
+    health: Number.isFinite(bushState?.health) ? bushState.health : 0,
+    respawnTimer: Number.isFinite(bushState?.respawnTimer) ? Math.max(0, bushState.respawnTimer) : 0
+  })) : [];
+
+  const normalizeFoundationList = (list) => {
+    if (!Array.isArray(list)) return [];
+    return list.map((foundationState) => ({
+      x: Number.isFinite(foundationState?.x) ? foundationState.x : 0
+    }));
+  };
+
+  const sourceFoundationsByZone = source.foundationsByZone && typeof source.foundationsByZone === "object"
+    ? source.foundationsByZone
+    : null;
+  const legacyZone = source.zone === ZONE_REDWOODS ? ZONE_REDWOODS : ZONE_BEACH;
+  const normalizedFoundationsByZone = {
+    [ZONE_BEACH]: sourceFoundationsByZone
+      ? normalizeFoundationList(sourceFoundationsByZone[ZONE_BEACH])
+      : (legacyZone === ZONE_BEACH ? normalizeFoundationList(source.foundations) : []),
+    [ZONE_REDWOODS]: sourceFoundationsByZone
+      ? normalizeFoundationList(sourceFoundationsByZone[ZONE_REDWOODS])
+      : (legacyZone === ZONE_REDWOODS ? normalizeFoundationList(source.foundations) : [])
+  };
+
+  const normalizeToolCount = (value) => {
+    if (value === true) return 1;
+    return clampResource(value);
+  };
+  const normalizedCraftSelection = source.craftSelection === "axe" || source.craftSelection === "foundation"
+    ? source.craftSelection
+    : "pickaxe";
+
   return {
     zone: source.zone === ZONE_REDWOODS ? ZONE_REDWOODS : ZONE_BEACH,
     inventory: {
       thatch: clampResource(sourceInventory.thatch),
+      fiber: clampResource(sourceInventory.fiber),
       wood: clampResource(sourceInventory.wood),
       stone: clampResource(sourceInventory.stone),
       flint: clampResource(sourceInventory.flint),
       metal: clampResource(sourceInventory.metal),
-      pickaxe: !!sourceInventory.pickaxe,
-      axe: !!sourceInventory.axe
+      pickaxe: normalizeToolCount(sourceInventory.pickaxe),
+      axe: normalizeToolCount(sourceInventory.axe),
+      foundation: normalizeToolCount(sourceInventory.foundation)
     },
     hotbar: {
       slots: normalizedSlots,
       selected: selectedSlot
     },
-    craftSelection: source.craftSelection === "axe" ? "axe" : "pickaxe",
-    selectedInventoryTool: source.selectedInventoryTool === "pickaxe" || source.selectedInventoryTool === "axe"
+    craftSelection: normalizedCraftSelection,
+    selectedInventoryTool: source.selectedInventoryTool === "pickaxe" || source.selectedInventoryTool === "axe" || source.selectedInventoryTool === "foundation"
       ? source.selectedInventoryTool
       : "hands",
     trees: normalizedTrees,
     stones: normalizedStones,
-    pebbles: normalizedPebbles
+    pebbles: normalizedPebbles,
+    bushes: normalizedBushes,
+    foundationsByZone: normalizedFoundationsByZone
   };
 }
 
@@ -440,9 +519,58 @@ function normalizeWorldRecord(world, index = 0) {
   };
 }
 
+function generateGuestId() {
+  return `guest_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+}
+
+function getOrCreateGuestProfile() {
+  if (guestProfile && typeof guestProfile.id === "string" && guestProfile.id) {
+    return guestProfile;
+  }
+
+  try {
+    const raw = localStorage.getItem(GUEST_PROFILE_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && typeof parsed.id === "string" && parsed.id.trim()) {
+        const id = parsed.id.trim().toLowerCase();
+        const name = typeof parsed.name === "string" && parsed.name.trim()
+          ? parsed.name.trim()
+          : `Guest-${id.slice(-4).toUpperCase()}`;
+        guestProfile = { id, name };
+        return guestProfile;
+      }
+    }
+  } catch {
+    // Ignore storage errors and create an in-memory guest profile.
+  }
+
+  const id = generateGuestId();
+  guestProfile = {
+    id,
+    name: `Guest-${id.slice(-4).toUpperCase()}`
+  };
+  try {
+    localStorage.setItem(GUEST_PROFILE_STORAGE_KEY, JSON.stringify(guestProfile));
+  } catch {
+    // Ignore storage errors.
+  }
+  return guestProfile;
+}
+
+function getPlayerIdentityKey() {
+  const accountKey = (signedInEmail || signedInUser || "").trim().toLowerCase();
+  if (accountKey) return accountKey;
+  return getOrCreateGuestProfile().id;
+}
+
+function getPlayerDisplayName() {
+  if (signedInUser) return signedInUser;
+  return getOrCreateGuestProfile().name;
+}
+
 function getWorldOwnerId() {
-  const owner = (signedInEmail || signedInUser || "").trim().toLowerCase();
-  return owner || "guest";
+  return getPlayerIdentityKey();
 }
 
 function getWorldSavesStorageKey() {
@@ -453,7 +581,7 @@ function loadWorldSavesForCurrentUser() {
   worldSaves = [];
   selectedWorldId = "";
   activeWorldId = "";
-  if (!signedInUser) return;
+  worldListScroll = 0;
 
   try {
     const raw = localStorage.getItem(getWorldSavesStorageKey());
@@ -470,13 +598,13 @@ function loadWorldSavesForCurrentUser() {
     if (!worldSaves.some((world) => world.id === selectedWorldId)) {
       selectedWorldId = worldSaves.length > 0 ? worldSaves[0].id : "";
     }
+    clampWorldListScroll();
   } catch {
     // Ignore world save load errors.
   }
 }
 
 function saveWorldSavesForCurrentUser() {
-  if (!signedInUser) return;
   try {
     const payload = {
       version: 1,
@@ -494,12 +622,14 @@ function captureWorldDataFromGame() {
     zone: currentZone,
     inventory: {
       thatch: inventory.thatch,
+      fiber: inventory.fiber,
       wood: inventory.wood,
       stone: inventory.stone,
       flint: inventory.flint,
       metal: inventory.metal,
       pickaxe: inventory.pickaxe,
-      axe: inventory.axe
+      axe: inventory.axe,
+      foundation: inventory.foundation
     },
     hotbar: {
       slots: hotbar.slots.slice(),
@@ -508,11 +638,13 @@ function captureWorldDataFromGame() {
     craftSelection,
     selectedInventoryTool,
     trees: trees.map((tree) => ({
+      x: tree.x,
       alive: tree.alive,
       health: tree.health,
       respawnTimer: tree.respawnTimer
     })),
     stones: stones.map((stone) => ({
+      x: stone.x,
       alive: stone.alive,
       health: stone.health,
       respawnTimer: stone.respawnTimer,
@@ -521,7 +653,21 @@ function captureWorldDataFromGame() {
     pebbles: pebbles.map((pebble) => ({
       picked: pebble.picked,
       respawnTimer: pebble.respawnTimer
-    }))
+    })),
+    bushes: bushes.map((bush) => ({
+      x: bush.x,
+      alive: bush.alive,
+      health: bush.health,
+      respawnTimer: bush.respawnTimer
+    })),
+    foundationsByZone: {
+      [ZONE_BEACH]: getFoundationsForZone(ZONE_BEACH).map((foundation) => ({
+        x: foundation.x
+      })),
+      [ZONE_REDWOODS]: getFoundationsForZone(ZONE_REDWOODS).map((foundation) => ({
+        x: foundation.x
+      }))
+    }
   });
 }
 
@@ -530,12 +676,14 @@ function applyWorldDataToGame(data) {
   currentZone = normalized.zone;
 
   inventory.thatch = normalized.inventory.thatch;
+  inventory.fiber = normalized.inventory.fiber;
   inventory.wood = normalized.inventory.wood;
   inventory.stone = normalized.inventory.stone;
   inventory.flint = normalized.inventory.flint;
   inventory.metal = normalized.inventory.metal;
   inventory.pickaxe = normalized.inventory.pickaxe;
   inventory.axe = normalized.inventory.axe;
+  inventory.foundation = normalized.inventory.foundation;
 
   for (let i = 0; i < hotbar.slots.length; i++) {
     hotbar.slots[i] = normalized.hotbar.slots[i] ?? null;
@@ -551,6 +699,9 @@ function applyWorldDataToGame(data) {
   for (let i = 0; i < trees.length; i++) {
     const tree = trees[i];
     const saved = normalized.trees[i];
+    const fallbackX = DEFAULT_TREE_XS[i] ?? (120 + i * 260);
+    const treeX = Number.isFinite(saved?.x) ? saved.x : fallbackX;
+    tree.x = resolveTreeXAwayFromRedwood(clampXWithWidth(treeX, tree.trunkW), tree.trunkW);
     if (!saved) {
       tree.alive = true;
       tree.health = tree.maxHealth;
@@ -569,6 +720,9 @@ function applyWorldDataToGame(data) {
   for (let i = 0; i < stones.length; i++) {
     const stone = stones[i];
     const saved = normalized.stones[i];
+    const fallbackX = DEFAULT_STONE_XS[i] ?? (250 + i * 300);
+    const stoneX = Number.isFinite(saved?.x) ? saved.x : fallbackX;
+    stone.x = clampXWithWidth(stoneX, stone.w);
     if (!saved) {
       stone.alive = true;
       stone.respawnTimer = 0;
@@ -587,6 +741,7 @@ function applyWorldDataToGame(data) {
     }
   }
 
+  syncPebblePositionsFromStones();
   for (let i = 0; i < pebbles.length; i++) {
     const pebble = pebbles[i];
     const saved = normalized.pebbles[i];
@@ -594,7 +749,45 @@ function applyWorldDataToGame(data) {
     pebble.respawnTimer = Math.max(0, saved?.respawnTimer || 0);
   }
 
-  resetDinosaursForZone(currentZone);
+  for (let i = 0; i < bushes.length; i++) {
+    const bush = bushes[i];
+    const saved = normalized.bushes[i];
+    const fallbackX = DEFAULT_BUSH_XS[i] ?? (80 + i * 150);
+    const bushX = Number.isFinite(saved?.x) ? saved.x : fallbackX;
+    bush.x = clampXWithWidth(bushX, bush.w);
+    if (!saved) {
+      bush.alive = true;
+      bush.health = bush.maxHealth;
+      bush.respawnTimer = 0;
+      continue;
+    }
+    bush.alive = !!saved.alive;
+    bush.respawnTimer = Math.max(0, saved.respawnTimer);
+    if (bush.alive) {
+      bush.health = Math.max(1, Math.min(bush.maxHealth, Number.isFinite(saved.health) ? saved.health : bush.maxHealth));
+    } else {
+      bush.health = 0;
+    }
+  }
+  resolveBushStoneConflicts();
+
+  for (const zone of [ZONE_BEACH, ZONE_REDWOODS]) {
+    const zoneFoundations = getFoundationsForZone(zone);
+    zoneFoundations.length = 0;
+    const savedFoundations = normalized.foundationsByZone?.[zone] || [];
+    for (const saved of savedFoundations) {
+      const snappedX = Math.round(saved.x / FOUNDATION_SNAP) * FOUNDATION_SNAP;
+      const x = Math.max(0, Math.min(WORLD_WIDTH - FOUNDATION_WIDTH, snappedX));
+      zoneFoundations.push({
+        x,
+        y: GROUND_Y - FOUNDATION_HEIGHT,
+        w: FOUNDATION_WIDTH,
+        h: FOUNDATION_HEIGHT
+      });
+    }
+  }
+
+  resetAllDinosaurs();
 }
 
 function getWorldById(worldId) {
@@ -603,7 +796,6 @@ function getWorldById(worldId) {
 }
 
 function saveCurrentWorld(force = false) {
-  if (!signedInUser) return;
   if (!force && !gameStarted) return;
   const world = getWorldById(activeWorldId || selectedWorldId);
   if (!world) return;
@@ -616,10 +808,6 @@ function saveCurrentWorld(force = false) {
 
 function startGameWithWorld(worldId) {
   if (gameStarted) return;
-  if (!signedInUser) {
-    setMenuStatus("Sign in first with Google.");
-    return;
-  }
   const world = getWorldById(worldId);
   if (!world) {
     setMenuStatus("Select or create a world first.");
@@ -640,6 +828,7 @@ function startGameWithWorld(worldId) {
   wantsInteract = false;
   wantsCraftPickaxe = false;
   wantsCraftAxe = false;
+  wantsCraftFoundation = false;
   wantsRespawn = false;
   respawnMenuOpen = false;
   inventoryOpen = false;
@@ -654,10 +843,6 @@ function startGameWithWorld(worldId) {
 }
 
 function createNewWorld() {
-  if (!signedInUser) {
-    setMenuStatus("Sign in first to create worlds.");
-    return;
-  }
   const defaultName = `World ${worldSaves.length + 1}`;
   const nameInput = prompt("Create new world name:", defaultName);
   if (nameInput === null) return;
@@ -669,11 +854,13 @@ function createNewWorld() {
     name,
     createdAt: now,
     updatedAt: now,
-    data: createDefaultWorldData()
+    data: createNewWorldData()
   };
   worldSaves.unshift(world);
   selectedWorldId = id;
   activeWorldId = "";
+  worldListScroll = 0;
+  clampWorldListScroll();
   saveWorldSavesForCurrentUser();
   setMenuStatus(`Created ${name}.`);
 }
@@ -683,12 +870,14 @@ function captureCharacterDataFromGame() {
     zone: currentZone,
     inventory: {
       thatch: inventory.thatch,
+      fiber: inventory.fiber,
       wood: inventory.wood,
       stone: inventory.stone,
       flint: inventory.flint,
       metal: inventory.metal,
       pickaxe: inventory.pickaxe,
-      axe: inventory.axe
+      axe: inventory.axe,
+      foundation: inventory.foundation
     },
     hotbar: {
       slots: hotbar.slots.slice(),
@@ -703,12 +892,14 @@ function applyCharacterDataToGame(data) {
   const normalized = normalizeWorldData(data);
   currentZone = normalized.zone;
   inventory.thatch = normalized.inventory.thatch;
+  inventory.fiber = normalized.inventory.fiber;
   inventory.wood = normalized.inventory.wood;
   inventory.stone = normalized.inventory.stone;
   inventory.flint = normalized.inventory.flint;
   inventory.metal = normalized.inventory.metal;
   inventory.pickaxe = normalized.inventory.pickaxe;
   inventory.axe = normalized.inventory.axe;
+  inventory.foundation = normalized.inventory.foundation;
   for (let i = 0; i < hotbar.slots.length; i++) {
     hotbar.slots[i] = normalized.hotbar.slots[i] ?? null;
   }
@@ -719,7 +910,7 @@ function applyCharacterDataToGame(data) {
   if (!isToolOwned(selectedInventoryTool)) {
     selectedInventoryTool = "hands";
   }
-  resetDinosaursForZone(currentZone);
+  resetAllDinosaurs();
 }
 
 function resetWorldResourcesToDefault() {
@@ -737,19 +928,55 @@ function resetWorldResourcesToDefault() {
     pebble.picked = false;
     pebble.respawnTimer = 0;
   }
+  for (const bush of bushes) {
+    bush.alive = true;
+    bush.health = bush.maxHealth;
+    bush.respawnTimer = 0;
+  }
+  for (const zone of [ZONE_BEACH, ZONE_REDWOODS]) {
+    getFoundationsForZone(zone).length = 0;
+  }
+}
+
+function clampWorldListScroll() {
+  const maxScroll = Math.max(0, worldSaves.length - MAX_WORLD_LIST_BUTTONS);
+  if (!Number.isFinite(worldListScroll)) {
+    worldListScroll = 0;
+    return;
+  }
+  worldListScroll = Math.max(0, Math.min(maxScroll, Math.floor(worldListScroll)));
+}
+
+function scrollWorldList(delta) {
+  if (!Number.isFinite(delta) || delta === 0) return;
+  worldListScroll += delta;
+  clampWorldListScroll();
+}
+
+function deleteWorld(worldId) {
+  const index = worldSaves.findIndex((world) => world.id === worldId);
+  if (index < 0) return;
+  const removed = worldSaves[index];
+  const removedName = removed?.name || "World";
+  worldSaves.splice(index, 1);
+
+  if (selectedWorldId === worldId) {
+    selectedWorldId = worldSaves.length > 0 ? worldSaves[Math.min(index, worldSaves.length - 1)].id : "";
+  }
+  if (activeWorldId === worldId) {
+    activeWorldId = "";
+  }
+  clampWorldListScroll();
+  saveWorldSavesForCurrentUser();
+  setMenuStatus(`Deleted ${removedName}.`);
 }
 
 function getDefaultMultiplayerServerUrl() {
-  try {
-    const saved = localStorage.getItem(MULTIPLAYER_LAST_SERVER_KEY);
-    if (saved && /^wss?:\/\//.test(saved)) {
-      return saved;
-    }
-  } catch {
-    // Ignore storage errors.
-  }
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const host = location.hostname || "localhost";
+  if (location.host) {
+    return `${protocol}//${location.host}`;
+  }
   return `${protocol}//${host}:8080`;
 }
 
@@ -759,6 +986,37 @@ function saveLastMultiplayerServerUrl(url) {
   } catch {
     // Ignore storage errors.
   }
+}
+
+function getMultiplayerServerCandidates() {
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const host = location.hostname || "localhost";
+  const candidates = [];
+  const sameOrigin = location.host ? `${protocol}//${location.host}` : "";
+  const fallback = `${protocol}//${host}:8080`;
+  const runningLocalDevPort = (host === "localhost" || host === "127.0.0.1") && location.port && location.port !== "8080";
+
+  if (runningLocalDevPort) {
+    if (!candidates.includes(fallback)) candidates.push(fallback);
+    if (sameOrigin && !candidates.includes(sameOrigin)) candidates.push(sameOrigin);
+  } else {
+    if (sameOrigin && !candidates.includes(sameOrigin)) candidates.push(sameOrigin);
+    if (!candidates.includes(fallback)) candidates.push(fallback);
+  }
+
+  try {
+    const saved = localStorage.getItem(MULTIPLAYER_LAST_SERVER_KEY);
+    if (saved && /^wss?:\/\//.test(saved)) {
+      const normalized = saved.trim();
+      if (!candidates.includes(normalized)) {
+        candidates.push(normalized);
+      }
+    }
+  } catch {
+    // Ignore storage errors.
+  }
+
+  return candidates;
 }
 
 function hasOpenMultiplayerConnection() {
@@ -878,6 +1136,7 @@ function startMultiplayerGameSession(characterData) {
   wantsInteract = false;
   wantsCraftPickaxe = false;
   wantsCraftAxe = false;
+  wantsCraftFoundation = false;
   wantsRespawn = false;
   respawnMenuOpen = false;
   inventoryOpen = false;
@@ -925,14 +1184,14 @@ function handleMultiplayerServerMessage(rawData) {
     startMultiplayerGameSession(message.characterData);
     const worldLabel = multiplayerWorldName || "World";
     if (multiplayerIsHost) {
-      setMenuStatus(`Hosting ${worldLabel} (Code: ${multiplayerWorldId}).`);
+      setMenuStatus(`Hosting ${worldLabel} (Invite: ${multiplayerWorldId}).`);
       try {
-        alert(`World code: ${multiplayerWorldId}\nShare this code so friends can join.`);
+        alert(`Invite code: ${multiplayerWorldId}\nShare this code so friends can join.`);
       } catch {
         // Ignore alert failures.
       }
     } else {
-      setMenuStatus(`Joined ${worldLabel} (Code: ${multiplayerWorldId}).`);
+      setMenuStatus(`Joined ${worldLabel} (Invite: ${multiplayerWorldId}).`);
     }
     return;
   }
@@ -950,21 +1209,26 @@ function handleMultiplayerServerMessage(rawData) {
 }
 
 function beginMultiplayerConnection(mode, serverUrl, worldId, worldName) {
-  if (!signedInUser) {
-    setMenuStatus("Sign in first with Google.");
+  if (!isGoogleSignedIn()) {
+    setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
     return;
   }
+
   suppressMultiplayerCloseNotice = false;
   disconnectMultiplayer(true);
 
+  const url = (typeof serverUrl === "string" && /^wss?:\/\//.test(serverUrl))
+    ? serverUrl.trim()
+    : getDefaultMultiplayerServerUrl();
+
   multiplayerIsHost = mode === "host";
-  multiplayerServerUrl = serverUrl;
+  multiplayerServerUrl = url;
   multiplayerWorldId = worldId || "";
   multiplayerWorldName = worldName || worldId || "";
 
   let ws = null;
   try {
-    ws = new WebSocket(serverUrl);
+    ws = new WebSocket(url);
   } catch {
     setMenuStatus("Invalid server URL.");
     return;
@@ -973,16 +1237,16 @@ function beginMultiplayerConnection(mode, serverUrl, worldId, worldName) {
   multiplayerSocket = ws;
   multiplayerConnected = false;
   multiplayerHadServerError = false;
-  setMenuStatus(`Connecting to ${serverUrl}...`);
+  setMenuStatus(`Connecting to ${url}...`);
 
   ws.addEventListener("open", () => {
-    saveLastMultiplayerServerUrl(serverUrl);
+    saveLastMultiplayerServerUrl(url);
     sendMultiplayerMessage("hello", {
       mode,
       worldId: multiplayerWorldId,
       worldName: multiplayerWorldName,
-      playerKey: (signedInEmail || signedInUser || "").trim().toLowerCase(),
-      displayName: signedInUser,
+      playerKey: getPlayerIdentityKey(),
+      displayName: getPlayerDisplayName(),
       characterData: captureCharacterDataFromGame()
     }, false);
     setMenuStatus("Waiting for server...");
@@ -1023,17 +1287,18 @@ function beginMultiplayerConnection(mode, serverUrl, worldId, worldName) {
       lastTime = performance.now();
     } else if (!gameStarted) {
       if (!hadServerError) {
-        setMenuStatus("Could not connect to multiplayer server.");
+        setMenuStatus("Could not connect. Start server with npm start, then open http://localhost:8080.");
       }
     }
   });
 }
 
 function beginMultiplayerFlow() {
-  if (!signedInUser) {
-    setMenuStatus("Sign in first with Google.");
+  if (!isGoogleSignedIn()) {
+    setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
     return;
   }
+
   const modeInput = prompt("Multiplayer: type host or join.", "host");
   if (!modeInput) return;
   const mode = modeInput.trim().toLowerCase();
@@ -1042,29 +1307,42 @@ function beginMultiplayerFlow() {
     return;
   }
 
-  const serverInput = prompt("Server URL (ws:// or wss://)", getDefaultMultiplayerServerUrl());
-  if (!serverInput) return;
-  const serverUrl = serverInput.trim();
-  if (!/^wss?:\/\//.test(serverUrl)) {
-    setMenuStatus("Server URL must start with ws:// or wss://");
-    return;
-  }
-
   if (mode === "host") {
     const worldNameInput = prompt("World name:", `World ${worldSaves.length + 1}`);
     if (worldNameInput === null) return;
     const worldName = normalizeWorldName(worldNameInput, worldSaves.length);
-    beginMultiplayerConnection("host", serverUrl, "", worldName);
+    const candidates = getMultiplayerServerCandidates();
+    if (candidates.length === 0) {
+      setMenuStatus("No multiplayer server URL available.");
+      return;
+    }
+    beginMultiplayerConnection("host", candidates[0], "", worldName);
     return;
   }
 
-  const worldIdInput = prompt("World code to join:", selectedWorldId || multiplayerWorldId || "");
+  const worldIdInput = prompt("Invite code to join:", multiplayerWorldId || "");
   if (!worldIdInput) return;
   const worldId = worldIdInput.trim().toUpperCase();
-  beginMultiplayerConnection("join", serverUrl, worldId, "");
+  if (!/^[A-Z0-9]{6}$/.test(worldId)) {
+    setMenuStatus("Invite code must be 6 letters/numbers.");
+    return;
+  }
+  const candidates = getMultiplayerServerCandidates();
+  if (candidates.length === 0) {
+    setMenuStatus("No multiplayer server URL available.");
+    return;
+  }
+  beginMultiplayerConnection("join", candidates[0], worldId, "");
 }
 
-const trees = [300, 650, 980, 1320, 1660, 2030, 2360].map((x) => ({
+const DEFAULT_TREE_XS = [188, 472, 739, 1096, 1418, 1763, 2311];
+const DEFAULT_STONE_XS = [460, 820, 1170, 1540, 1880, 2260];
+const DEFAULT_BUSH_XS = [86, 173, 322, 497, 689, 842, 1017, 1193, 1334, 1528, 1711, 1898, 2137, 2362];
+const PEBBLE_OFFSETS = [-28, -14, 4, 18, 30];
+const TREE_REDWOOD_CLEARANCE = 42;
+const STONE_BUSH_MIN_DISTANCE = 86;
+
+const trees = DEFAULT_TREE_XS.map((x) => ({
   x,
   baseY: GROUND_Y,
   trunkW: 24,
@@ -1081,6 +1359,87 @@ const redwoodProps = [
   { x: 1970, baseY: GROUND_Y, trunkW: 46, trunkH: 220, canopyY: 230 }
 ];
 
+function clampXWithWidth(x, width = 0) {
+  const rounded = Math.round(x);
+  return Math.max(20, Math.min(WORLD_WIDTH - width - 20, rounded));
+}
+
+function isOverlappingRedwoodTrunk(x, width = 0, padding = 0) {
+  const itemMin = x - padding;
+  const itemMax = x + width + padding;
+  for (const redwood of redwoodProps) {
+    const redwoodMin = redwood.x - 12;
+    const redwoodMax = redwood.x + redwood.trunkW + 12;
+    if (itemMax > redwoodMin && itemMin < redwoodMax) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveTreeXAwayFromRedwood(x, treeWidth = 24) {
+  let resolved = clampXWithWidth(x, treeWidth);
+  for (let i = 0; i < 10; i++) {
+    let changed = false;
+    for (const redwood of redwoodProps) {
+      const blockedMin = redwood.x - TREE_REDWOOD_CLEARANCE;
+      const blockedMax = redwood.x + redwood.trunkW + TREE_REDWOOD_CLEARANCE;
+      if (resolved + treeWidth > blockedMin && resolved < blockedMax) {
+        const leftCandidate = clampXWithWidth(blockedMin - treeWidth - 6, treeWidth);
+        const rightCandidate = clampXWithWidth(blockedMax + 6, treeWidth);
+        resolved = Math.abs(resolved - leftCandidate) <= Math.abs(rightCandidate - resolved)
+          ? leftCandidate
+          : rightCandidate;
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) break;
+  }
+  return resolved;
+}
+
+function pickRandomSpacedXPositions({
+  count,
+  minX,
+  maxX,
+  minSpacing,
+  isBlocked = null
+}) {
+  const xs = [];
+  const tryAdd = (rawX) => {
+    const x = Math.round(rawX);
+    if (isBlocked && isBlocked(x)) return false;
+    for (const existing of xs) {
+      if (Math.abs(existing - x) < minSpacing) return false;
+    }
+    xs.push(x);
+    return true;
+  };
+
+  const maxAttempts = count * 180;
+  let attempts = 0;
+  while (xs.length < count && attempts < maxAttempts) {
+    attempts++;
+    const candidate = minX + Math.random() * (maxX - minX);
+    tryAdd(candidate);
+  }
+
+  for (let scan = minX; xs.length < count && scan <= maxX; scan += Math.max(28, Math.floor(minSpacing * 0.58))) {
+    const jitter = (Math.random() - 0.5) * minSpacing * 0.35;
+    tryAdd(scan + jitter);
+  }
+
+  for (let guard = 0; xs.length < count && guard < count * 60; guard++) {
+    const candidate = minX + Math.random() * (maxX - minX);
+    if (isBlocked && isBlocked(candidate)) continue;
+    xs.push(Math.round(candidate));
+  }
+
+  xs.sort((a, b) => a - b);
+  return xs.slice(0, count);
+}
+
 function rollMetalNode() {
   return Math.random() < METAL_NODE_CHANCE;
 }
@@ -1092,7 +1451,7 @@ function rerollStoneNode(stone) {
   stone.maxHealth = nodeHealth;
 }
 
-const stones = [460, 820, 1170, 1540, 1880, 2260].map((x) => {
+const stones = DEFAULT_STONE_XS.map((x) => {
   const stone = {
     x,
     y: GROUND_Y - 30,
@@ -1108,17 +1467,192 @@ const stones = [460, 820, 1170, 1540, 1880, 2260].map((x) => {
   return stone;
 });
 
-const pebbles = stones.flatMap((stone) => (
-  [-28, -14, 4, 18, 30].map((offset, index) => ({
-    x: stone.x + offset + index,
-    y: GROUND_Y - 8 - (index % 2),
-    w: 10,
-    h: 8,
-    value: 1,
-    picked: false,
+function createPebbleNodesForStones(stoneNodes) {
+  return stoneNodes.flatMap((stone) => (
+    PEBBLE_OFFSETS.map((offset, index) => ({
+      x: stone.x + offset + index,
+      y: GROUND_Y - 8 - (index % 2),
+      w: 10,
+      h: 8,
+      value: 1,
+      picked: false,
+      respawnTimer: 0
+    }))
+  ));
+}
+
+const pebbles = createPebbleNodesForStones(stones);
+
+function syncPebblePositionsFromStones() {
+  let pebbleIndex = 0;
+  for (const stone of stones) {
+    for (let i = 0; i < PEBBLE_OFFSETS.length; i++) {
+      const pebble = pebbles[pebbleIndex++];
+      if (!pebble) return;
+      pebble.x = stone.x + PEBBLE_OFFSETS[i] + i;
+      pebble.y = GROUND_Y - 8 - (i % 2);
+    }
+  }
+}
+
+const bushes = DEFAULT_BUSH_XS.map((x) => ({
+  x,
+  y: GROUND_Y - 24,
+  w: 44,
+  h: 24,
+  health: 3,
+  maxHealth: 3,
+  alive: true,
+  respawnTimer: 0
+}));
+
+function resolveBushStoneConflicts() {
+  for (const bush of bushes) {
+    let attempts = 0;
+    while (
+      attempts < 18 &&
+      stones.some((stone) => Math.abs((stone.x + stone.w / 2) - (bush.x + bush.w / 2)) < STONE_BUSH_MIN_DISTANCE)
+    ) {
+      const direction = attempts % 2 === 0 ? 1 : -1;
+      const step = STONE_BUSH_MIN_DISTANCE + 8 + attempts * 5;
+      bush.x = clampXWithWidth(bush.x + direction * step, bush.w);
+      attempts++;
+    }
+  }
+}
+
+function createRandomResourceLayoutData() {
+  const treeXs = pickRandomSpacedXPositions({
+    count: DEFAULT_TREE_XS.length,
+    minX: 80,
+    maxX: WORLD_WIDTH - 90,
+    minSpacing: 180,
+    isBlocked: (x) => isOverlappingRedwoodTrunk(x, 24, TREE_REDWOOD_CLEARANCE)
+  }).map((x) => resolveTreeXAwayFromRedwood(x, 24));
+
+  const stoneXs = pickRandomSpacedXPositions({
+    count: DEFAULT_STONE_XS.length,
+    minX: 90,
+    maxX: WORLD_WIDTH - 100,
+    minSpacing: 165
+  });
+
+  const bushXs = pickRandomSpacedXPositions({
+    count: DEFAULT_BUSH_XS.length,
+    minX: 44,
+    maxX: WORLD_WIDTH - 66,
+    minSpacing: 90,
+    isBlocked: (x) => stoneXs.some((stoneX) => Math.abs(stoneX - x) < STONE_BUSH_MIN_DISTANCE)
+  });
+
+  const randomTrees = treeXs.map((x) => ({
+    x,
+    alive: true,
+    health: 4,
     respawnTimer: 0
-  }))
-));
+  }));
+  const randomStones = stoneXs.map((x) => {
+    const isMetal = rollMetalNode();
+    const maxHealth = isMetal ? METAL_NODE_HEALTH : STONE_NODE_HEALTH;
+    return {
+      x,
+      alive: true,
+      health: maxHealth,
+      respawnTimer: 0,
+      isMetal
+    };
+  });
+  const randomBushes = bushXs.map((x) => ({
+    x,
+    alive: true,
+    health: 3,
+    respawnTimer: 0
+  }));
+
+  return {
+    trees: randomTrees,
+    stones: randomStones,
+    pebbles: Array.from({ length: DEFAULT_STONE_XS.length * PEBBLE_OFFSETS.length }, () => ({
+      picked: false,
+      respawnTimer: 0
+    })),
+    bushes: randomBushes
+  };
+}
+
+const foundationsByZone = {
+  [ZONE_BEACH]: [],
+  [ZONE_REDWOODS]: []
+};
+
+function getFoundationsForZone(zone = currentZone) {
+  return zone === ZONE_REDWOODS ? foundationsByZone[ZONE_REDWOODS] : foundationsByZone[ZONE_BEACH];
+}
+
+function createFoundationAt(x) {
+  return {
+    x,
+    y: GROUND_Y - FOUNDATION_HEIGHT,
+    w: FOUNDATION_WIDTH,
+    h: FOUNDATION_HEIGHT
+  };
+}
+
+function isFoundationPlacementBlocked(x) {
+  const zoneFoundations = getFoundationsForZone();
+  for (const foundation of zoneFoundations) {
+    if (Math.abs(foundation.x - x) < FOUNDATION_WIDTH - 6) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveFoundationPlacementX() {
+  const desiredCenterX = player.x + player.w / 2 + player.facing * FOUNDATION_PLACE_OFFSET;
+  const snappedX = Math.round((desiredCenterX - FOUNDATION_WIDTH / 2) / FOUNDATION_SNAP) * FOUNDATION_SNAP;
+  const clampedX = Math.max(0, Math.min(WORLD_WIDTH - FOUNDATION_WIDTH, snappedX));
+  if (!isFoundationPlacementBlocked(clampedX)) {
+    return clampedX;
+  }
+
+  const searchOffsets = [FOUNDATION_SNAP, -FOUNDATION_SNAP, FOUNDATION_SNAP * 2, -FOUNDATION_SNAP * 2, FOUNDATION_SNAP * 3, -FOUNDATION_SNAP * 3];
+  for (const offset of searchOffsets) {
+    const candidate = Math.max(0, Math.min(WORLD_WIDTH - FOUNDATION_WIDTH, clampedX + offset));
+    if (isFoundationPlacementBlocked(candidate)) continue;
+    return candidate;
+  }
+  return null;
+}
+
+function tryPlaceFoundation() {
+  if (inventory.foundation <= 0) {
+    setNotice("Need a thatch foundation crafted.");
+    return false;
+  }
+
+  const placeX = resolveFoundationPlacementX();
+  if (placeX === null) {
+    setNotice("No room to place foundation.");
+    return false;
+  }
+
+  getFoundationsForZone().push(createFoundationAt(placeX));
+  inventory.foundation = Math.max(0, inventory.foundation - 1);
+  sanitizeHotbarSlots();
+  setNotice(`Placed Thatch Foundation (${inventory.foundation} left).`);
+  return true;
+}
+
+function forEachSolidPlatform(callback) {
+  for (const plat of platforms) {
+    callback(plat);
+  }
+  const zoneFoundations = getFoundationsForZone();
+  for (const foundation of zoneFoundations) {
+    callback(foundation);
+  }
+}
 
 function createZoneSpawnPoints(xs) {
   return xs.map((x, index) => ({
@@ -1139,9 +1673,12 @@ function getZoneDinoSpawnPoints(zone = currentZone) {
 function rollDinoType(zone = currentZone) {
   if (zone === ZONE_REDWOODS) {
     const roll = Math.random();
-    if (roll < 0.05) return "thylacoleo";
-    if (roll < 0.525) return "parasaur";
-    return "raptor";
+    if (roll < 0.01) return "trex";
+    const otherRoll = (roll - 0.01) / 0.99;
+    if (otherRoll < 0.25) return "parasaur";
+    if (otherRoll < 0.5) return "gallimimus";
+    if (otherRoll < 0.75) return "raptor";
+    return "thylacoleo";
   }
 
   const roll = Math.random();
@@ -1185,6 +1722,7 @@ function createDinoAtSpawn(spawn, forcedType = null, zone = currentZone) {
     treePerched: false,
     treePerchX: 0,
     treePerchY: 0,
+    pounceStunArmed: false,
     aggroTimer: 0,
     anim: Math.random() * Math.PI * 2
   };
@@ -1215,6 +1753,13 @@ function createDinoAtSpawn(spawn, forcedType = null, zone = currentZone) {
     dino.speed = 62 + Math.random() * 10;
     dino.health = 150;
     dino.maxHealth = 150;
+  } else if (type === "gallimimus") {
+    dino.w = 64;
+    dino.h = 38;
+    dino.y = GROUND_Y - 38;
+    dino.speed = 132 + Math.random() * 18;
+    dino.health = 300;
+    dino.maxHealth = 300;
   } else if (type === "raptor") {
     dino.w = 56;
     dino.h = 36;
@@ -1233,8 +1778,8 @@ function createDinoAtSpawn(spawn, forcedType = null, zone = currentZone) {
     dino.y = GROUND_Y - 38;
     dino.groundY = dino.y;
     dino.speed = 122 + Math.random() * 10;
-    dino.health = 180;
-    dino.maxHealth = 180;
+    dino.health = 300;
+    dino.maxHealth = 300;
     dino.attackDamage = 26;
     dino.attackInterval = 0.85;
     dino.attackReachX = 64;
@@ -1260,6 +1805,18 @@ function createDinoAtSpawn(spawn, forcedType = null, zone = currentZone) {
       dino.minX = Math.max(20, dino.treePerchX - 190);
       dino.maxX = Math.min(WORLD_WIDTH - 20, dino.treePerchX + 190);
     }
+  } else if (type === "trex") {
+    dino.w = 204;
+    dino.h = 124;
+    dino.y = GROUND_Y - 124;
+    dino.speed = 84 + Math.random() * 8;
+    dino.health = 1000;
+    dino.maxHealth = 1000;
+    dino.attackDamage = 70;
+    dino.attackInterval = NPC_ATTACK_COOLDOWN;
+    dino.attackReachX = 184;
+    dino.attackReachY = 144;
+    dino.faceDeadzone = 14;
   } else {
     dino.w = 78;
     dino.h = 46;
@@ -1277,15 +1834,33 @@ function createDinoAtSpawn(spawn, forcedType = null, zone = currentZone) {
   return dino;
 }
 
-const dinosaurs = beachDinoSpawnPoints.map((spawn) => createDinoAtSpawn(spawn, null, ZONE_BEACH));
+function createZoneDinosaurs(zone) {
+  return getZoneDinoSpawnPoints(zone).map((spawn) => createDinoAtSpawn(spawn, null, zone));
+}
+
+const dinosaursByZone = {
+  [ZONE_BEACH]: createZoneDinosaurs(ZONE_BEACH),
+  [ZONE_REDWOODS]: createZoneDinosaurs(ZONE_REDWOODS)
+};
+let dinosaurs = dinosaursByZone[ZONE_BEACH];
+
+function activateZoneDinosaurs(zone) {
+  const normalizedZone = zone === ZONE_REDWOODS ? ZONE_REDWOODS : ZONE_BEACH;
+  dinosaurs = dinosaursByZone[normalizedZone];
+}
 
 function resetDinosaursForZone(zone) {
-  const zoneSpawns = getZoneDinoSpawnPoints(zone);
-  for (let i = 0; i < dinosaurs.length; i++) {
-    const dino = dinosaurs[i];
-    const spawn = zoneSpawns[i % zoneSpawns.length];
-    Object.assign(dino, createDinoAtSpawn(spawn, null, zone));
+  const normalizedZone = zone === ZONE_REDWOODS ? ZONE_REDWOODS : ZONE_BEACH;
+  dinosaursByZone[normalizedZone] = createZoneDinosaurs(normalizedZone);
+  if (currentZone === normalizedZone) {
+    activateZoneDinosaurs(normalizedZone);
   }
+}
+
+function resetAllDinosaurs() {
+  resetDinosaursForZone(ZONE_BEACH);
+  resetDinosaursForZone(ZONE_REDWOODS);
+  activateZoneDinosaurs(currentZone);
 }
 
 let cameraX = 0;
@@ -1293,7 +1868,7 @@ let lastTime = performance.now();
 
 window.addEventListener("keydown", (event) => {
   const code = event.code;
-  const handledKeys = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "KeyE", "KeyF", "KeyC", "KeyM", "KeyR", "Escape", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Numpad1", "Numpad2"];
+  const handledKeys = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "KeyE", "KeyF", "KeyC", "KeyM", "KeyR", "Escape", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Numpad1", "Numpad2", "Slash"];
   if (!gameStarted) {
     if (handledKeys.includes(code)) {
       event.preventDefault();
@@ -1322,6 +1897,7 @@ window.addEventListener("keydown", (event) => {
       wantsInteract = false;
       wantsCraftPickaxe = false;
       wantsCraftAxe = false;
+      wantsCraftFoundation = false;
     }
     keys.clear();
     event.preventDefault();
@@ -1335,6 +1911,15 @@ window.addEventListener("keydown", (event) => {
     return;
   }
 
+  if (code === "Slash" && !event.repeat) {
+    const rawCommand = prompt("Enter command:", "/dinoreset");
+    if (rawCommand !== null) {
+      runGameCommand(rawCommand);
+    }
+    event.preventDefault();
+    return;
+  }
+
   tryStartBackgroundMusic();
   if (code === "ArrowUp" || code === "Space" || code === "KeyW") {
     wantsJump = true;
@@ -1344,6 +1929,7 @@ window.addEventListener("keydown", (event) => {
   }
   if (code === "KeyC" && !event.repeat) {
     if (craftSelection === "axe") wantsCraftAxe = true;
+    else if (craftSelection === "foundation") wantsCraftFoundation = true;
     else wantsCraftPickaxe = true;
   }
   if (code === "KeyE" && !event.repeat) {
@@ -1432,6 +2018,17 @@ canvas.addEventListener("mousedown", (event) => {
   event.preventDefault();
 });
 
+canvas.addEventListener("wheel", (event) => {
+  if (gameStarted) return;
+  if (mainMenuScreen !== MENU_SINGLEPLAYER) return;
+  const mouse = getCanvasPoint(event);
+  if (!pointInRect(mouse.x, mouse.y, inputState.mainMenu.worldListPanel)) return;
+
+  const direction = event.deltaY > 0 ? 1 : -1;
+  scrollWorldList(direction);
+  event.preventDefault();
+}, { passive: false });
+
 canvas.addEventListener("touchstart", () => {
   tryStartBackgroundMusic();
 }, { passive: true });
@@ -1464,6 +2061,24 @@ function setNotice(message, duration = 1.8) {
   noticeTimer = duration;
 }
 
+function runGameCommand(rawCommand) {
+  if (typeof rawCommand !== "string") return false;
+  const normalized = rawCommand.trim().toLowerCase().replace(/^\/+/, "");
+  if (!normalized) return false;
+
+  if (normalized === "dinoreset" || normalized === "resetdinos") {
+    resetAllDinosaurs();
+    setNotice("All dinos reset.");
+    if (!isMultiplayerGame && activeWorldId) {
+      saveCurrentWorld(true);
+    }
+    return true;
+  }
+
+  setNotice(`Unknown command: ${normalized}`);
+  return false;
+}
+
 function decodeJwtPayload(token) {
   if (typeof token !== "string") return null;
   try {
@@ -1491,6 +2106,10 @@ function hasGoogleClientId() {
 
 function hasGoogleAuthSupportedOrigin() {
   return location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+}
+
+function isGoogleSignedIn() {
+  return !!(signedInUser && signedInUser.trim());
 }
 
 function saveSignedInUser() {
@@ -1684,10 +2303,6 @@ function dealDamageToPlayer(amount) {
 }
 
 function startGame() {
-  if (!signedInUser) {
-    setMenuStatus("Sign in first with Google.");
-    return;
-  }
   mainMenuScreen = MENU_MODE;
 }
 
@@ -1717,6 +2332,7 @@ function returnToTitleScreen() {
   wantsInteract = false;
   wantsCraftPickaxe = false;
   wantsCraftAxe = false;
+  wantsCraftFoundation = false;
   wantsRespawn = false;
   keys.clear();
   player.vx = 0;
@@ -1751,6 +2367,10 @@ function handleMainMenuClick(mouseX, mouseY) {
       return;
     }
     if (pointInRect(mouseX, mouseY, inputState.mainMenu.multiplayerButton)) {
+      if (!isGoogleSignedIn()) {
+        setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
+        return;
+      }
       beginMultiplayerFlow();
       return;
     }
@@ -1764,6 +2384,24 @@ function handleMainMenuClick(mouseX, mouseY) {
   if (mainMenuScreen === MENU_SINGLEPLAYER) {
     if (pointInRect(mouseX, mouseY, inputState.mainMenu.createWorldButton)) {
       createNewWorld();
+      return;
+    }
+    if (pointInRect(mouseX, mouseY, inputState.mainMenu.worldScrollUpButton)) {
+      scrollWorldList(-1);
+      return;
+    }
+    if (pointInRect(mouseX, mouseY, inputState.mainMenu.worldScrollDownButton)) {
+      scrollWorldList(1);
+      return;
+    }
+    for (const deleteButton of inputState.mainMenu.worldDeleteButtons) {
+      if (!pointInRect(mouseX, mouseY, deleteButton)) continue;
+      const world = getWorldById(deleteButton.worldId);
+      const worldName = world?.name || "this world";
+      const confirmed = confirm(`Delete ${worldName}? This cannot be undone.`);
+      if (confirmed) {
+        deleteWorld(deleteButton.worldId);
+      }
       return;
     }
     for (const worldButton of inputState.mainMenu.worldButtons) {
@@ -1789,11 +2427,8 @@ function getZoneSpawnX(zone = currentZone) {
 
 function respawnPlayer(zone = currentZone) {
   const targetZone = zone === ZONE_REDWOODS ? ZONE_REDWOODS : ZONE_BEACH;
-  const zoneChanged = currentZone !== targetZone;
   currentZone = targetZone;
-  if (zoneChanged) {
-    resetDinosaursForZone(targetZone);
-  }
+  activateZoneDinosaurs(targetZone);
 
   player.x = getZoneSpawnX(targetZone);
   player.y = PLAYER_SPAWN_Y;
@@ -1801,6 +2436,7 @@ function respawnPlayer(zone = currentZone) {
   player.vy = 0;
   player.health = player.maxHealth;
   player.regenCooldown = 0;
+  player.stunTimer = 0;
   player.dead = false;
   player.respawnTimer = 0;
   player.onGround = false;
@@ -1812,6 +2448,7 @@ function respawnPlayer(zone = currentZone) {
 
 function killPlayer() {
   player.health = 0;
+  player.stunTimer = 0;
   if (player.dead) return;
   player.dead = true;
   player.respawnTimer = PLAYER_RESPAWN_SECONDS;
@@ -1827,11 +2464,8 @@ function killPlayer() {
 function fastTravelToZone(zone) {
   if (zone !== ZONE_BEACH && zone !== ZONE_REDWOODS) return;
 
-  const zoneChanged = currentZone !== zone;
   currentZone = zone;
-  if (zoneChanged) {
-    resetDinosaursForZone(zone);
-  }
+  activateZoneDinosaurs(zone);
   mapOpen = false;
   inventoryOpen = false;
 
@@ -1898,15 +2532,24 @@ function getCanvasPoint(event) {
 
 function isToolOwned(tool) {
   if (tool === "hands") return true;
+  if (tool === "pickaxe") return inventory.pickaxe > 0;
+  if (tool === "axe") return inventory.axe > 0;
+  if (tool === "foundation") return inventory.foundation > 0;
+  return false;
+}
+
+function getToolCount(tool) {
   if (tool === "pickaxe") return inventory.pickaxe;
   if (tool === "axe") return inventory.axe;
-  return false;
+  if (tool === "foundation") return inventory.foundation;
+  return 0;
 }
 
 function getToolLabel(tool) {
   if (tool === "hands") return "Hands";
   if (tool === "pickaxe") return "Stone Pickaxe";
   if (tool === "axe") return "Stone Axe";
+  if (tool === "foundation") return "Thatch Foundation";
   return "Empty Slot";
 }
 
@@ -1949,6 +2592,10 @@ function canCraftPickaxe() {
 
 function canCraftAxe() {
   return inventory.flint >= 3 && inventory.stone >= 2 && inventory.thatch >= 10 && inventory.wood >= 1;
+}
+
+function canCraftFoundation() {
+  return inventory.wood >= 20 && inventory.thatch >= 50 && inventory.fiber >= 40;
 }
 
 function getNearestTree(maxDistance = 85) {
@@ -2107,6 +2754,51 @@ function getNearestParasaur(maxDistance = 105) {
   return nearest;
 }
 
+function getNearestBush(maxDistance = 85) {
+  let nearest = null;
+  let nearestDist = Number.POSITIVE_INFINITY;
+  const playerCenterX = player.x + player.w / 2;
+  const playerFeetY = player.y + player.h;
+
+  for (const bush of bushes) {
+    if (!bush.alive) continue;
+    const bushCenterX = bush.x + bush.w / 2;
+    const bushCenterY = bush.y + bush.h / 2;
+    const dx = playerCenterX - bushCenterX;
+    const dy = playerFeetY - bushCenterY;
+    const dist = Math.hypot(dx, dy);
+    if (dist <= maxDistance && dist < nearestDist) {
+      nearest = bush;
+      nearestDist = dist;
+    }
+  }
+
+  return nearest;
+}
+
+function getNearestGallimimus(maxDistance = 110) {
+  if (!zoneHasDinoSpawns()) return null;
+  let nearest = null;
+  let nearestDist = Number.POSITIVE_INFINITY;
+  const playerCenterX = player.x + player.w / 2;
+  const playerCenterY = player.y + player.h / 2;
+
+  for (const gallimimus of dinosaurs) {
+    if (!gallimimus.alive || gallimimus.type !== "gallimimus") continue;
+    const gallimimusCenterX = gallimimus.x + gallimimus.w / 2;
+    const gallimimusCenterY = gallimimus.y + gallimimus.h / 2;
+    const dx = playerCenterX - gallimimusCenterX;
+    const dy = playerCenterY - gallimimusCenterY;
+    const dist = Math.hypot(dx, dy);
+    if (dist <= maxDistance && dist < nearestDist) {
+      nearest = gallimimus;
+      nearestDist = dist;
+    }
+  }
+
+  return nearest;
+}
+
 function getNearestRaptor(maxDistance = 95) {
   if (!zoneHasDinoSpawns()) return null;
   let nearest = null;
@@ -2153,6 +2845,29 @@ function getNearestThylacoleo(maxDistance = 100) {
   return nearest;
 }
 
+function getNearestTrex(maxDistance = 130) {
+  if (!zoneHasDinoSpawns()) return null;
+  let nearest = null;
+  let nearestDist = Number.POSITIVE_INFINITY;
+  const playerCenterX = player.x + player.w / 2;
+  const playerCenterY = player.y + player.h / 2;
+
+  for (const trex of dinosaurs) {
+    if (!trex.alive || trex.type !== "trex") continue;
+    const trexCenterX = trex.x + trex.w / 2;
+    const trexCenterY = trex.y + trex.h / 2;
+    const dx = playerCenterX - trexCenterX;
+    const dy = playerCenterY - trexCenterY;
+    const dist = Math.hypot(dx, dy);
+    if (dist <= maxDistance && dist < nearestDist) {
+      nearest = trex;
+      nearestDist = dist;
+    }
+  }
+
+  return nearest;
+}
+
 function getInteractionTarget(maxDistance = 90) {
   const candidates = [];
 
@@ -2175,6 +2890,13 @@ function getInteractionTarget(maxDistance = 90) {
     const pebbleCenterX = pebble.x + pebble.w / 2;
     const dist = Math.abs(player.x + player.w / 2 - pebbleCenterX);
     candidates.push({ type: "pebble", entity: pebble, dist });
+  }
+
+  const bush = getNearestBush(maxDistance);
+  if (bush) {
+    const bushCenterX = bush.x + bush.w / 2;
+    const dist = Math.abs(player.x + player.w / 2 - bushCenterX);
+    candidates.push({ type: "bush", entity: bush, dist });
   }
 
   const dodo = getNearestDodo(maxDistance);
@@ -2205,6 +2927,13 @@ function getInteractionTarget(maxDistance = 90) {
     candidates.push({ type: "thylacoleo", entity: thylacoleo, dist });
   }
 
+  const trex = getNearestTrex(maxDistance + 24);
+  if (trex) {
+    const trexCenterX = trex.x + trex.w / 2;
+    const dist = Math.abs(player.x + player.w / 2 - trexCenterX);
+    candidates.push({ type: "trex", entity: trex, dist });
+  }
+
   const trike = getNearestTriceratops(maxDistance + 20);
   if (trike) {
     const trikeCenterX = trike.x + trike.w / 2;
@@ -2219,8 +2948,15 @@ function getInteractionTarget(maxDistance = 90) {
     candidates.push({ type: "parasaur", entity: parasaur, dist });
   }
 
+  const gallimimus = getNearestGallimimus(maxDistance + 15);
+  if (gallimimus) {
+    const gallimimusCenterX = gallimimus.x + gallimimus.w / 2;
+    const dist = Math.abs(player.x + player.w / 2 - gallimimusCenterX);
+    candidates.push({ type: "gallimimus", entity: gallimimus, dist });
+  }
+
   if (candidates.length === 0) return null;
-  const typePriority = { pebble: 0, tree: 1, stone: 2, thylacoleo: 3, raptor: 4, dilo: 5, trike: 6, parasaur: 7, dodo: 8 };
+  const typePriority = { pebble: 0, bush: 1, tree: 2, stone: 3, trex: 4, thylacoleo: 5, raptor: 6, dilo: 7, trike: 8, parasaur: 9, gallimimus: 10, dodo: 11 };
   candidates.sort((a, b) => {
     if (a.dist !== b.dist) return a.dist - b.dist;
     return typePriority[a.type] - typePriority[b.type];
@@ -2233,10 +2969,6 @@ function craftPickaxe() {
     setNotice("Open inventory (E) to craft.");
     return;
   }
-  if (inventory.pickaxe) {
-    setNotice("Stone pickaxe already crafted.");
-    return;
-  }
   if (!canCraftPickaxe()) {
     setNotice("Need 3 stone, 10 thatch, 2 wood.");
     return;
@@ -2245,18 +2977,14 @@ function craftPickaxe() {
   inventory.stone -= 3;
   inventory.thatch -= 10;
   inventory.wood -= 2;
-  inventory.pickaxe = true;
+  inventory.pickaxe += 1;
   assignToolToHotbar("pickaxe", hotbar.selected);
-  setNotice("Crafted Stone Pickaxe.");
+  setNotice(`Crafted Stone Pickaxe (${inventory.pickaxe}).`);
 }
 
 function craftAxe() {
   if (!inventoryOpen) {
     setNotice("Open inventory (E) to craft.");
-    return;
-  }
-  if (inventory.axe) {
-    setNotice("Stone axe already crafted.");
     return;
   }
   if (!canCraftAxe()) {
@@ -2268,9 +2996,27 @@ function craftAxe() {
   inventory.stone -= 2;
   inventory.thatch -= 10;
   inventory.wood -= 1;
-  inventory.axe = true;
+  inventory.axe += 1;
   assignToolToHotbar("axe", hotbar.selected);
-  setNotice("Crafted Stone Axe.");
+  setNotice(`Crafted Stone Axe (${inventory.axe}).`);
+}
+
+function craftFoundation() {
+  if (!inventoryOpen) {
+    setNotice("Open inventory (E) to craft.");
+    return;
+  }
+  if (!canCraftFoundation()) {
+    setNotice("Need 20 wood, 50 thatch, 40 fiber.");
+    return;
+  }
+
+  inventory.wood -= 20;
+  inventory.thatch -= 50;
+  inventory.fiber -= 40;
+  inventory.foundation += 1;
+  assignToolToHotbar("foundation", hotbar.selected);
+  setNotice(`Crafted Thatch Foundation (${inventory.foundation}).`);
 }
 
 function handleInventoryClick(mouseX, mouseY) {
@@ -2284,6 +3030,11 @@ function handleInventoryClick(mouseX, mouseY) {
   if (pointInRect(mouseX, mouseY, ui.craftAxeButton)) {
     craftSelection = "axe";
     wantsCraftAxe = true;
+    return;
+  }
+  if (pointInRect(mouseX, mouseY, ui.craftFoundationButton)) {
+    craftSelection = "foundation";
+    wantsCraftFoundation = true;
     return;
   }
 
@@ -2318,6 +3069,78 @@ function handleInventoryClick(mouseX, mouseY) {
   }
 }
 
+function moveGroundDino(dino, deltaX, turnOnBlock = true) {
+  if (!Number.isFinite(deltaX) || deltaX === 0) return;
+  const oldX = dino.x;
+  dino.x += deltaX;
+
+  let blockedLeft = false;
+  let blockedRight = false;
+  const zoneFoundations = getFoundationsForZone();
+  for (const foundation of zoneFoundations) {
+    if (!overlaps(dino, foundation)) continue;
+
+    if (deltaX > 0 && oldX + dino.w <= foundation.x + 0.5) {
+      dino.x = Math.min(dino.x, foundation.x - dino.w);
+      blockedRight = true;
+      continue;
+    }
+    if (deltaX < 0 && oldX >= foundation.x + foundation.w - 0.5) {
+      dino.x = Math.max(dino.x, foundation.x + foundation.w);
+      blockedLeft = true;
+      continue;
+    }
+
+    const pushLeft = Math.abs((dino.x + dino.w) - foundation.x);
+    const pushRight = Math.abs(dino.x - (foundation.x + foundation.w));
+    if (pushLeft <= pushRight) {
+      dino.x = foundation.x - dino.w;
+      blockedRight = true;
+    } else {
+      dino.x = foundation.x + foundation.w;
+      blockedLeft = true;
+    }
+  }
+
+  if (dino.x < 0) {
+    dino.x = 0;
+    if (deltaX < 0) blockedLeft = true;
+  } else if (dino.x + dino.w > WORLD_WIDTH) {
+    dino.x = WORLD_WIDTH - dino.w;
+    if (deltaX > 0) blockedRight = true;
+  }
+
+  if (turnOnBlock) {
+    if (blockedRight && dino.dir > 0) dino.dir = -1;
+    else if (blockedLeft && dino.dir < 0) dino.dir = 1;
+  }
+}
+
+function patrolDinoHomeArea(dino, dt, calmSpeedMultiplier = 1, returnSpeedMultiplier = 1.2) {
+  const homeMin = Number.isFinite(dino.minX) ? dino.minX : 0;
+  const homeMax = Number.isFinite(dino.maxX) ? dino.maxX : WORLD_WIDTH;
+  const right = dino.x + dino.w;
+
+  if (right < homeMin) {
+    dino.dir = 1;
+    moveGroundDino(dino, dino.speed * returnSpeedMultiplier * dt);
+    return;
+  }
+  if (dino.x > homeMax) {
+    dino.dir = -1;
+    moveGroundDino(dino, -dino.speed * returnSpeedMultiplier * dt);
+    return;
+  }
+
+  if (dino.dir < 0 && dino.x <= homeMin + 1) {
+    dino.dir = 1;
+  } else if (dino.dir > 0 && right >= homeMax - 1) {
+    dino.dir = -1;
+  }
+
+  moveGroundDino(dino, dino.dir * dino.speed * calmSpeedMultiplier * dt);
+}
+
 function updateDinoRespawns(dt) {
   if (!zoneHasDinoSpawns()) return;
   for (const dino of dinosaurs) {
@@ -2334,18 +3157,11 @@ function updateDodos(dt) {
   for (const dodo of dinosaurs) {
     if (!dodo.alive || dodo.type !== "dodo") continue;
 
-    const moveSpeed = dodo.fleeTimer > 0 ? dodo.speed * 1.15 : dodo.speed;
-    dodo.x += dodo.dir * moveSpeed * dt;
-    if (dodo.x < dodo.minX) {
-      dodo.x = dodo.minX;
-      dodo.dir = 1;
-    } else if (dodo.x + dodo.w > dodo.maxX) {
-      dodo.x = dodo.maxX - dodo.w;
-      dodo.dir = -1;
-    }
-
     if (dodo.fleeTimer > 0) {
+      moveGroundDino(dodo, dodo.dir * dodo.speed * 1.15 * dt);
       dodo.fleeTimer = Math.max(0, dodo.fleeTimer - dt);
+    } else {
+      patrolDinoHomeArea(dodo, dt);
     }
     dodo.anim += dt * 8;
   }
@@ -2371,20 +3187,11 @@ function updateDilophosaurs(dt) {
       else if (dxToPlayer < -dilo.faceDeadzone) dilo.dir = -1;
       const stopDistanceX = Math.max(22, dilo.attackReachX - 10);
       if (horizontalDistance > stopDistanceX) {
-        dilo.x += dilo.dir * dilo.speed * 1.3 * dt;
+        moveGroundDino(dilo, dilo.dir * dilo.speed * 1.3 * dt);
       }
     } else {
-      dilo.x += dilo.dir * dilo.speed * dt;
-      if (dilo.x < dilo.minX) {
-        dilo.x = dilo.minX;
-        dilo.dir = 1;
-      } else if (dilo.x + dilo.w > dilo.maxX) {
-        dilo.x = dilo.maxX - dilo.w;
-        dilo.dir = -1;
-      }
+      patrolDinoHomeArea(dilo, dt);
     }
-
-    dilo.x = Math.max(dilo.minX, Math.min(dilo.maxX - dilo.w, dilo.x));
 
     if (dilo.attackCooldown > 0) {
       dilo.attackCooldown = Math.max(0, dilo.attackCooldown - dt);
@@ -2423,20 +3230,11 @@ function updateRaptors(dt) {
       else if (dxToPlayer < -raptor.faceDeadzone) raptor.dir = -1;
       const stopDistanceX = Math.max(24, raptor.attackReachX - 10);
       if (horizontalDistance > stopDistanceX) {
-        raptor.x += raptor.dir * raptor.speed * 1.45 * dt;
+        moveGroundDino(raptor, raptor.dir * raptor.speed * 1.45 * dt);
       }
     } else {
-      raptor.x += raptor.dir * raptor.speed * dt;
-      if (raptor.x < raptor.minX) {
-        raptor.x = raptor.minX;
-        raptor.dir = 1;
-      } else if (raptor.x + raptor.w > raptor.maxX) {
-        raptor.x = raptor.maxX - raptor.w;
-        raptor.dir = -1;
-      }
+      patrolDinoHomeArea(raptor, dt);
     }
-
-    raptor.x = Math.max(raptor.minX, Math.min(raptor.maxX - raptor.w, raptor.x));
 
     if (raptor.attackCooldown > 0) {
       raptor.attackCooldown = Math.max(0, raptor.attackCooldown - dt);
@@ -2483,6 +3281,7 @@ function updateThylacoleos(dt) {
         thylacoleo.treePerched = false;
         thylacoleo.vy = 280;
         thylacoleo.dir = dxToPlayer >= 0 ? 1 : -1;
+        thylacoleo.pounceStunArmed = true;
       }
 
       thylacoleo.anim += dt * 6.2;
@@ -2492,12 +3291,24 @@ function updateThylacoleos(dt) {
     if (thylacoleo.y < thylacoleo.groundY || thylacoleo.vy > 0) {
       thylacoleo.vy += gravity * 0.72 * dt;
       thylacoleo.y += thylacoleo.vy * dt;
-      thylacoleo.x += thylacoleo.dir * thylacoleo.speed * 0.65 * dt;
+      moveGroundDino(thylacoleo, thylacoleo.dir * thylacoleo.speed * 0.65 * dt);
       if (thylacoleo.y >= thylacoleo.groundY) {
         thylacoleo.y = thylacoleo.groundY;
         thylacoleo.vy = 0;
+        thylacoleo.pounceStunArmed = false;
       }
-      thylacoleo.x = Math.max(thylacoleo.minX, Math.min(thylacoleo.maxX - thylacoleo.w, thylacoleo.x));
+
+      if (
+        thylacoleo.pounceStunArmed &&
+        !player.dead &&
+        player.health > 0 &&
+        overlaps(thylacoleo, player)
+      ) {
+        dealDamageToPlayer(thylacoleo.attackDamage);
+        thylacoleo.attackCooldown = thylacoleo.attackInterval;
+        thylacoleo.pounceStunArmed = false;
+        player.stunTimer = Math.max(player.stunTimer, THYLACOLEO_POUNCE_STUN_SECONDS);
+      }
       if (thylacoleo.attackCooldown > 0) {
         thylacoleo.attackCooldown = Math.max(0, thylacoleo.attackCooldown - dt);
       }
@@ -2510,20 +3321,11 @@ function updateThylacoleos(dt) {
       else if (dxToPlayer < -thylacoleo.faceDeadzone) thylacoleo.dir = -1;
       const stopDistanceX = Math.max(26, thylacoleo.attackReachX - 12);
       if (horizontalDistance > stopDistanceX) {
-        thylacoleo.x += thylacoleo.dir * thylacoleo.speed * 1.38 * dt;
+        moveGroundDino(thylacoleo, thylacoleo.dir * thylacoleo.speed * 1.38 * dt);
       }
     } else {
-      thylacoleo.x += thylacoleo.dir * thylacoleo.speed * dt;
-      if (thylacoleo.x < thylacoleo.minX) {
-        thylacoleo.x = thylacoleo.minX;
-        thylacoleo.dir = 1;
-      } else if (thylacoleo.x + thylacoleo.w > thylacoleo.maxX) {
-        thylacoleo.x = thylacoleo.maxX - thylacoleo.w;
-        thylacoleo.dir = -1;
-      }
+      patrolDinoHomeArea(thylacoleo, dt);
     }
-
-    thylacoleo.x = Math.max(thylacoleo.minX, Math.min(thylacoleo.maxX - thylacoleo.w, thylacoleo.x));
 
     if (thylacoleo.attackCooldown > 0) {
       thylacoleo.attackCooldown = Math.max(0, thylacoleo.attackCooldown - dt);
@@ -2539,6 +3341,49 @@ function updateThylacoleos(dt) {
     }
 
     thylacoleo.anim += dt * 10.2;
+  }
+}
+
+function updateTrexes(dt) {
+  if (!zoneHasDinoSpawns()) return;
+  for (const trex of dinosaurs) {
+    if (!trex.alive || trex.type !== "trex") continue;
+
+    const playerCenterX = player.x + player.w / 2;
+    const playerCenterY = player.y + player.h / 2;
+    const trexCenterX = trex.x + trex.w / 2;
+    const trexCenterY = trex.y + trex.h / 2;
+    const dxToPlayer = playerCenterX - trexCenterX;
+    const dyToPlayer = playerCenterY - trexCenterY;
+    const horizontalDistance = Math.abs(dxToPlayer);
+    const verticalDistance = Math.abs(dyToPlayer);
+    const aggro = horizontalDistance <= 420 && verticalDistance <= 130;
+
+    if (aggro) {
+      if (dxToPlayer > trex.faceDeadzone) trex.dir = 1;
+      else if (dxToPlayer < -trex.faceDeadzone) trex.dir = -1;
+      const stopDistanceX = Math.max(40, trex.attackReachX - 14);
+      if (horizontalDistance > stopDistanceX) {
+        moveGroundDino(trex, trex.dir * trex.speed * 1.18 * dt);
+      }
+    } else {
+      patrolDinoHomeArea(trex, dt, 0.9, 1.1);
+    }
+
+    if (trex.attackCooldown > 0) {
+      trex.attackCooldown = Math.max(0, trex.attackCooldown - dt);
+    }
+
+    const updatedTrexCenterX = trex.x + trex.w / 2;
+    const updatedTrexCenterY = trex.y + trex.h / 2;
+    const biteDistanceX = Math.abs(playerCenterX - updatedTrexCenterX);
+    const biteDistanceY = Math.abs(playerCenterY - updatedTrexCenterY);
+    if (biteDistanceX <= trex.attackReachX && biteDistanceY <= trex.attackReachY && trex.attackCooldown <= 0 && player.health > 0) {
+      dealDamageToPlayer(trex.attackDamage);
+      trex.attackCooldown = trex.attackInterval;
+    }
+
+    trex.anim += dt * 6.3;
   }
 }
 
@@ -2566,20 +3411,11 @@ function updateTriceratops(dt) {
       else if (dxToPlayer < -trike.faceDeadzone) trike.dir = -1;
       const stopDistanceX = Math.max(28, trike.attackReachX - 12);
       if (horizontalDistance > stopDistanceX) {
-        trike.x += trike.dir * trike.speed * 1.35 * dt;
+        moveGroundDino(trike, trike.dir * trike.speed * 1.35 * dt);
       }
     } else {
-      trike.x += trike.dir * trike.speed * dt;
-      if (trike.x < trike.minX) {
-        trike.x = trike.minX;
-        trike.dir = 1;
-      } else if (trike.x + trike.w > trike.maxX) {
-        trike.x = trike.maxX - trike.w;
-        trike.dir = -1;
-      }
+      patrolDinoHomeArea(trike, dt);
     }
-
-    trike.x = Math.max(trike.minX, Math.min(trike.maxX - trike.w, trike.x));
 
     if (trike.aggroTimer > 0 && !player.dead && player.health > 0) {
       const updatedTrikeCenterX = trike.x + trike.w / 2;
@@ -2600,20 +3436,48 @@ function updateParasaurs(dt) {
   for (const parasaur of dinosaurs) {
     if (!parasaur.alive || parasaur.type !== "parasaur") continue;
 
-    const moveSpeed = parasaur.fleeTimer > 0 ? parasaur.speed * 1.45 : parasaur.speed;
-    parasaur.x += parasaur.dir * moveSpeed * dt;
-    if (parasaur.x < parasaur.minX) {
-      parasaur.x = parasaur.minX;
-      parasaur.dir = 1;
-    } else if (parasaur.x + parasaur.w > parasaur.maxX) {
-      parasaur.x = parasaur.maxX - parasaur.w;
-      parasaur.dir = -1;
-    }
-
     if (parasaur.fleeTimer > 0) {
+      moveGroundDino(parasaur, parasaur.dir * parasaur.speed * 1.45 * dt);
       parasaur.fleeTimer = Math.max(0, parasaur.fleeTimer - dt);
+    } else {
+      patrolDinoHomeArea(parasaur, dt);
     }
     parasaur.anim += dt * 7.1;
+  }
+}
+
+function updateGallimimus(dt) {
+  if (!zoneHasDinoSpawns()) return;
+  const playerCenterX = player.x + player.w / 2;
+  const playerCenterY = player.y + player.h / 2;
+  for (const gallimimus of dinosaurs) {
+    if (!gallimimus.alive || gallimimus.type !== "gallimimus") continue;
+
+    const gallimimusCenterX = gallimimus.x + gallimimus.w / 2;
+    const gallimimusCenterY = gallimimus.y + gallimimus.h / 2;
+    const dxToPlayer = playerCenterX - gallimimusCenterX;
+    const dyToPlayer = playerCenterY - gallimimusCenterY;
+    const horizontalDistance = Math.abs(dxToPlayer);
+    const verticalDistance = Math.abs(dyToPlayer);
+    const playerNearby = !player.dead && player.health > 0 && horizontalDistance <= 320 && verticalDistance <= 110;
+
+    if (playerNearby) {
+      // Passive creature: always runs away if a player gets close.
+      gallimimus.dir = dxToPlayer >= 0 ? -1 : 1;
+      gallimimus.fleeTimer = Math.max(gallimimus.fleeTimer, 0.35);
+    } else if (gallimimus.fleeTimer > 0) {
+      gallimimus.fleeTimer = Math.max(0, gallimimus.fleeTimer - dt);
+    }
+
+    const panicRunning = playerNearby || gallimimus.fleeTimer > 0;
+    if (panicRunning) {
+      const moveSpeed = gallimimus.speed * (playerNearby ? 1.55 : 1.35);
+      moveGroundDino(gallimimus, gallimimus.dir * moveSpeed * dt);
+    } else {
+      patrolDinoHomeArea(gallimimus, dt, 0.98, 1.2);
+    }
+
+    gallimimus.anim += dt * (panicRunning ? 10.3 : 8.6);
   }
 }
 
@@ -2643,6 +3507,15 @@ function updateResourceRespawns(dt) {
       pebble.picked = false;
     }
   }
+
+  for (const bush of bushes) {
+    if (bush.alive) continue;
+    bush.respawnTimer = Math.max(0, bush.respawnTimer - dt);
+    if (bush.respawnTimer <= 0) {
+      bush.alive = true;
+      bush.health = bush.maxHealth;
+    }
+  }
 }
 
 function update(dt) {
@@ -2659,8 +3532,12 @@ function update(dt) {
     inventoryOpen = false;
   }
   wantsRespawn = false;
+  if (!player.dead && player.stunTimer > 0) {
+    player.stunTimer = Math.max(0, player.stunTimer - dt);
+  }
+  const playerStunned = !player.dead && player.stunTimer > 0;
   updateDamageMusic(dt);
-  if (!isMultiplayerGame && signedInUser && activeWorldId) {
+  if (!isMultiplayerGame && activeWorldId) {
     worldAutoSaveTimer = Math.max(0, worldAutoSaveTimer - dt);
     if (worldAutoSaveTimer <= 0) {
       saveCurrentWorld(true);
@@ -2673,6 +3550,7 @@ function update(dt) {
     wantsInteract = false;
     wantsCraftPickaxe = false;
     wantsCraftAxe = false;
+    wantsCraftFoundation = false;
     player.vx = 0;
     player.vy = 0;
     cameraX = Math.max(0, Math.min(WORLD_WIDTH - VIEW_WIDTH, player.x - VIEW_WIDTH * 0.35));
@@ -2685,6 +3563,7 @@ function update(dt) {
     wantsInteract = false;
     wantsCraftPickaxe = false;
     wantsCraftAxe = false;
+    wantsCraftFoundation = false;
     updateResourceRespawns(dt);
     if (noticeTimer > 0) {
       noticeTimer = Math.max(0, noticeTimer - dt);
@@ -2694,9 +3573,11 @@ function update(dt) {
     }
     updateDinoRespawns(dt);
     updateParasaurs(dt);
+    updateGallimimus(dt);
     updateDodos(dt);
     updateRaptors(dt);
     updateThylacoleos(dt);
+    updateTrexes(dt);
     updateTriceratops(dt);
     updateDilophosaurs(dt);
     cameraX = Math.max(0, Math.min(WORLD_WIDTH - VIEW_WIDTH, player.x - VIEW_WIDTH * 0.35));
@@ -2706,7 +3587,7 @@ function update(dt) {
 
   const left = keys.has("ArrowLeft") || keys.has("KeyA");
   const right = keys.has("ArrowRight") || keys.has("KeyD");
-  const inputX = player.dead ? 0 : (right ? 1 : 0) - (left ? 1 : 0);
+  const inputX = (player.dead || playerStunned) ? 0 : (right ? 1 : 0) - (left ? 1 : 0);
 
   if (inputX !== 0) {
     player.vx += inputX * player.moveAccel * dt;
@@ -2719,8 +3600,11 @@ function update(dt) {
     }
   }
   player.vx = Math.max(-player.maxSpeed, Math.min(player.maxSpeed, player.vx));
+  if (playerStunned) {
+    player.vx = 0;
+  }
 
-  if (wantsJump && player.onGround && !player.dead) {
+  if (wantsJump && player.onGround && !player.dead && !playerStunned) {
     player.vy = -player.jumpSpeed;
     player.onGround = false;
   }
@@ -2732,8 +3616,8 @@ function update(dt) {
   const oldY = player.y;
 
   player.x += player.vx * dt;
-  for (const plat of platforms) {
-    if (!overlaps(player, plat)) continue;
+  forEachSolidPlatform((plat) => {
+    if (!overlaps(player, plat)) return;
 
     if (player.vx > 0 && oldX + player.w <= plat.x) {
       player.x = plat.x - player.w;
@@ -2742,12 +3626,12 @@ function update(dt) {
       player.x = plat.x + plat.w;
       player.vx = 0;
     }
-  }
+  });
 
   player.y += player.vy * dt;
   player.onGround = false;
-  for (const plat of platforms) {
-    if (!overlaps(player, plat)) continue;
+  forEachSolidPlatform((plat) => {
+    if (!overlaps(player, plat)) return;
 
     if (player.vy > 0 && oldY + player.h <= plat.y) {
       player.y = plat.y - player.h;
@@ -2757,7 +3641,7 @@ function update(dt) {
       player.y = plat.y + plat.h;
       player.vy = 0;
     }
-  }
+  });
 
   if (player.y > VIEW_HEIGHT + 400) {
     player.x = getZoneSpawnX();
@@ -2770,21 +3654,27 @@ function update(dt) {
 
   sanitizeHotbarSlots();
 
-  if (wantsCraftPickaxe && !player.dead) {
+  if (wantsCraftPickaxe && !player.dead && !playerStunned) {
     craftPickaxe();
   }
   wantsCraftPickaxe = false;
-  if (wantsCraftAxe && !player.dead) {
+  if (wantsCraftAxe && !player.dead && !playerStunned) {
     craftAxe();
   }
   wantsCraftAxe = false;
+  if (wantsCraftFoundation && !player.dead && !playerStunned) {
+    craftFoundation();
+  }
+  wantsCraftFoundation = false;
 
-  if (wantsInteract && !inventoryOpen && !player.dead) {
+  if (wantsInteract && !inventoryOpen && !player.dead && !playerStunned) {
     const activeTool = getActiveTool();
     const usingAxe = activeTool === "axe" && inventory.axe;
     const usingPickaxe = activeTool === "pickaxe" && inventory.pickaxe;
     const target = getInteractionTarget();
-    if (target?.type === "tree") {
+    if (activeTool === "foundation") {
+      tryPlaceFoundation();
+    } else if (target?.type === "tree") {
       const tree = target.entity;
       let thatchGain = 0;
       let woodGain = 0;
@@ -2896,6 +3786,25 @@ function update(dt) {
         inventory.stone += pebble.value;
         setNotice("+1 stone pebble.");
       }
+    } else if (target?.type === "bush") {
+      const bush = target.entity;
+      let bushDamage = 1;
+      let fiberGain = 8 + Math.floor(Math.random() * 5);
+      if (usingAxe || usingPickaxe) {
+        bushDamage = 2;
+        fiberGain += 3 + Math.floor(Math.random() * 3);
+      }
+      inventory.fiber += fiberGain;
+      bush.health -= bushDamage;
+      if (bush.health <= 0) {
+        bush.alive = false;
+        bush.health = 0;
+        bush.respawnTimer = RESOURCE_RESPAWN_SECONDS;
+        const bonusFiber = 6 + Math.floor(Math.random() * 4);
+        inventory.fiber += bonusFiber;
+        fiberGain += bonusFiber;
+      }
+      setNotice(`+${fiberGain} fiber.`, 1.2);
     } else if (target?.type === "dodo") {
       const dodo = target.entity;
       const dodoDamage = (usingPickaxe || usingAxe) ? 10 : 5;
@@ -2942,6 +3851,16 @@ function update(dt) {
         thylacoleo.respawnTimer = CREATURE_RESPAWN_SECONDS;
         setNotice("Thylacoleo down.");
       }
+    } else if (target?.type === "trex") {
+      const trex = target.entity;
+      const trexDamage = (usingPickaxe || usingAxe) ? 10 : 5;
+      trex.health -= trexDamage;
+      if (trex.health <= 0) {
+        trex.alive = false;
+        trex.health = 0;
+        trex.respawnTimer = CREATURE_RESPAWN_SECONDS;
+        setNotice("T-Rex down.");
+      }
     } else if (target?.type === "trike") {
       const trike = target.entity;
       const trikeDamage = (usingPickaxe || usingAxe) ? 10 : 5;
@@ -2976,6 +3895,23 @@ function update(dt) {
         parasaur.fleeTimer = 0;
         setNotice("Parasaur down.");
       }
+    } else if (target?.type === "gallimimus") {
+      const gallimimus = target.entity;
+      const gallimimusDamage = (usingPickaxe || usingAxe) ? 10 : 5;
+      gallimimus.health -= gallimimusDamage;
+
+      const playerCenterX = player.x + player.w / 2;
+      const gallimimusCenterX = gallimimus.x + gallimimus.w / 2;
+      gallimimus.dir = gallimimusCenterX >= playerCenterX ? 1 : -1;
+      gallimimus.fleeTimer = 4.2;
+
+      if (gallimimus.health <= 0) {
+        gallimimus.alive = false;
+        gallimimus.health = 0;
+        gallimimus.respawnTimer = CREATURE_RESPAWN_SECONDS;
+        gallimimus.fleeTimer = 0;
+        setNotice("Gallimimus down.");
+      }
     }
   }
   wantsInteract = false;
@@ -3000,9 +3936,11 @@ function update(dt) {
   player.x = Math.max(0, Math.min(WORLD_WIDTH - player.w, player.x));
   updateDinoRespawns(dt);
   updateParasaurs(dt);
+  updateGallimimus(dt);
   updateDodos(dt);
   updateRaptors(dt);
   updateThylacoleos(dt);
+  updateTrexes(dt);
   updateTriceratops(dt);
   updateDilophosaurs(dt);
   if (player.health <= 0) {
@@ -3147,11 +4085,15 @@ function drawBeachBackground() {
 
 function drawRedwoodsBackground() {
   const sky = ctx.createLinearGradient(0, 0, 0, VIEW_HEIGHT);
-  sky.addColorStop(0, "#7b96a8");
-  sky.addColorStop(0.45, "#a6c0a5");
-  sky.addColorStop(1, "#d8d3b8");
+  sky.addColorStop(0, "#5aa7e8");
+  sky.addColorStop(0.45, "#95d0f7");
+  sky.addColorStop(1, "#d8eefc");
   ctx.fillStyle = sky;
   ctx.fillRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
+
+  drawCloud(130 - cameraX * 0.03, 92, 1.0);
+  drawCloud(470 - cameraX * 0.025, 126, 0.84);
+  drawCloud(830 - cameraX * 0.035, 86, 1.08);
 
   const canopyShade = ctx.createLinearGradient(0, 0, 0, 180);
   canopyShade.addColorStop(0, "rgba(35, 68, 49, 0.75)");
@@ -3289,6 +4231,64 @@ function drawPebbles(interactionTarget) {
       ctx.strokeStyle = "#fff6d1";
       ctx.lineWidth = 2;
       ctx.strokeRect(sx - 4, pebble.y - 5, pebble.w + 8, pebble.h + 10);
+    }
+  }
+}
+
+function drawBushes(interactionTarget, frontLayer = false) {
+  const targetBush = interactionTarget?.type === "bush" ? interactionTarget.entity : null;
+  const redwoodsZone = currentZone === ZONE_REDWOODS;
+  const bushMain = redwoodsZone ? "#3d7b44" : "#4a9a5a";
+  const bushAccent = redwoodsZone ? "#5f9a5e" : "#70b86c";
+  const bushStem = redwoodsZone ? "#654227" : "#775230";
+
+  for (const bush of bushes) {
+    const overlapsRedwood = redwoodsZone && isOverlappingRedwoodTrunk(bush.x, bush.w, 8);
+    if (frontLayer) {
+      if (!overlapsRedwood) continue;
+    } else if (overlapsRedwood) {
+      continue;
+    }
+
+    const sx = Math.round(bush.x - cameraX);
+    if (sx + bush.w < -40 || sx > VIEW_WIDTH + 40) continue;
+
+    if (!bush.alive) {
+      ctx.fillStyle = bushStem;
+      ctx.fillRect(sx + bush.w / 2 - 2, bush.y + bush.h - 8, 4, 8);
+      continue;
+    }
+
+    const centerX = sx + bush.w / 2;
+    const baseY = bush.y + bush.h - 2;
+    ctx.fillStyle = bushMain;
+    ctx.beginPath();
+    ctx.ellipse(centerX, baseY - 8, bush.w * 0.46, bush.h * 0.42, 0, 0, Math.PI * 2);
+    ctx.ellipse(centerX - 10, baseY - 10, bush.w * 0.25, bush.h * 0.36, 0, 0, Math.PI * 2);
+    ctx.ellipse(centerX + 10, baseY - 10, bush.w * 0.25, bush.h * 0.36, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = bushAccent;
+    ctx.beginPath();
+    ctx.ellipse(centerX - 4, baseY - 13, bush.w * 0.2, bush.h * 0.22, 0, 0, Math.PI * 2);
+    ctx.ellipse(centerX + 6, baseY - 12, bush.w * 0.18, bush.h * 0.2, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = bushStem;
+    ctx.fillRect(centerX - 2, baseY - 2, 4, 4);
+
+    if (bush === targetBush && !inventoryOpen) {
+      ctx.strokeStyle = "#fff6d1";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(sx - 6, bush.y - 7, bush.w + 12, bush.h + 14);
+    }
+
+    if (bush.health < bush.maxHealth) {
+      const ratio = bush.health / bush.maxHealth;
+      ctx.fillStyle = "rgba(10, 20, 28, 0.7)";
+      ctx.fillRect(centerX - 16, bush.y - 12, 32, 5);
+      ctx.fillStyle = "#93e878";
+      ctx.fillRect(centerX - 16, bush.y - 12, 32 * ratio, 5);
     }
   }
 }
@@ -3705,6 +4705,72 @@ function drawThylacoleos(interactionTarget) {
   }
 }
 
+function drawTrexes(interactionTarget) {
+  if (!zoneHasDinoSpawns()) return;
+  const targetTrex = interactionTarget?.type === "trex" ? interactionTarget.entity : null;
+
+  for (const trex of dinosaurs) {
+    if (!trex.alive || trex.type !== "trex") continue;
+
+    const sx = Math.round(trex.x - cameraX);
+    if (sx + trex.w < -130 || sx > VIEW_WIDTH + 130) continue;
+
+    const bob = Math.sin(trex.anim) * 1.2;
+    const y = Math.round(trex.y + bob);
+    const facing = trex.dir >= 0 ? 1 : -1;
+    const headX = sx + (facing > 0 ? 75 : 27);
+    const jawTipX = headX + (facing > 0 ? 23 : -23);
+
+    ctx.fillStyle = "#677447";
+    ctx.beginPath();
+    ctx.ellipse(sx + 51, y + 35, 35, 21, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#5b673f";
+    ctx.fillRect(sx + (facing > 0 ? 56 : 37), y + 14, 12, 23);
+
+    ctx.fillStyle = "#788555";
+    ctx.beginPath();
+    ctx.arc(headX, y + 17, 14, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#e9dec4";
+    ctx.beginPath();
+    ctx.moveTo(headX + 9 * facing, y + 17);
+    ctx.lineTo(jawTipX, y + 22);
+    ctx.lineTo(headX + 9 * facing, y + 26);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = "#201c16";
+    ctx.fillRect(headX + (facing > 0 ? 4 : -5), y + 13, 3, 3);
+
+    ctx.fillStyle = "#4f5a37";
+    ctx.beginPath();
+    ctx.moveTo(sx + (facing > 0 ? 16 : 86), y + 35);
+    ctx.lineTo(sx + (facing > 0 ? -19 : 121), y + 24);
+    ctx.lineTo(sx + (facing > 0 ? 14 : 88), y + 42);
+    ctx.closePath();
+    ctx.fill();
+
+    const step = Math.sin(trex.anim * 1.6) * 2;
+    ctx.strokeStyle = "#3f492d";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(sx + 42, y + 52);
+    ctx.lineTo(sx + 42 + step, y + 62);
+    ctx.moveTo(sx + 63, y + 52);
+    ctx.lineTo(sx + 63 - step, y + 62);
+    ctx.stroke();
+
+    if (trex === targetTrex && !inventoryOpen) {
+      ctx.strokeStyle = "#fff6d1";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(sx - 8, y - 10, trex.w + 16, trex.h + 20);
+    }
+  }
+}
+
 function drawParasaurs(interactionTarget) {
   if (!zoneHasDinoSpawns()) return;
   const targetParasaur = interactionTarget?.type === "parasaur" ? interactionTarget.entity : null;
@@ -3774,6 +4840,69 @@ function drawParasaurs(interactionTarget) {
       ctx.strokeStyle = "#fff6d1";
       ctx.lineWidth = 2;
       ctx.strokeRect(sx - 6, y - 8, parasaur.w + 12, parasaur.h + 15);
+    }
+  }
+}
+
+function drawGallimimus(interactionTarget) {
+  if (!zoneHasDinoSpawns()) return;
+  const targetGallimimus = interactionTarget?.type === "gallimimus" ? interactionTarget.entity : null;
+
+  for (const gallimimus of dinosaurs) {
+    if (!gallimimus.alive || gallimimus.type !== "gallimimus") continue;
+
+    const sx = Math.round(gallimimus.x - cameraX);
+    if (sx + gallimimus.w < -70 || sx > VIEW_WIDTH + 70) continue;
+
+    const bob = Math.sin(gallimimus.anim) * 1.9;
+    const y = Math.round(gallimimus.y + bob);
+    const facing = gallimimus.dir >= 0 ? 1 : -1;
+    const headX = sx + (facing > 0 ? 53 : 13);
+
+    ctx.fillStyle = gallimimus.fleeTimer > 0 ? "#b8e3ac" : "#a8d89a";
+    ctx.beginPath();
+    ctx.ellipse(sx + 33, y + 22, 23, 13, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#89b982";
+    ctx.beginPath();
+    ctx.moveTo(sx + (facing > 0 ? 8 : 58), y + 22);
+    ctx.lineTo(sx + (facing > 0 ? -13 : 79), y + 18);
+    ctx.lineTo(sx + (facing > 0 ? 8 : 58), y + 28);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = gallimimus.fleeTimer > 0 ? "#cdeac2" : "#bfe2b1";
+    ctx.fillRect(sx + (facing > 0 ? 45 : 18), y + 8, 6, 16);
+    ctx.beginPath();
+    ctx.arc(headX, y + 9, 8, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#f0e4cb";
+    ctx.beginPath();
+    ctx.moveTo(headX + 5 * facing, y + 12);
+    ctx.lineTo(headX + 14 * facing, y + 14);
+    ctx.lineTo(headX + 5 * facing, y + 17);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = "#241e18";
+    ctx.fillRect(headX + (facing > 0 ? 2 : -4), y + 7, 2, 2);
+
+    const step = Math.sin(gallimimus.anim * 2.35) * 2.8;
+    ctx.strokeStyle = "#5f8d57";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(sx + 26, y + 33);
+    ctx.lineTo(sx + 26 + step, y + 40);
+    ctx.moveTo(sx + 40, y + 33);
+    ctx.lineTo(sx + 40 - step, y + 40);
+    ctx.stroke();
+
+    if (gallimimus === targetGallimimus && !inventoryOpen) {
+      ctx.strokeStyle = "#fff6d1";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(sx - 6, y - 8, gallimimus.w + 12, gallimimus.h + 15);
     }
   }
 }
@@ -3855,8 +4984,8 @@ function drawTriceratops(interactionTarget) {
 
 function drawPlatforms() {
   const redwoodsZone = currentZone === ZONE_REDWOODS;
-  const groundMain = redwoodsZone ? "#586944" : "#c79a56";
-  const groundTop = redwoodsZone ? "#6da057" : "#f5dfa2";
+  const groundMain = redwoodsZone ? "#56673f" : "#c79a56";
+  const groundTop = redwoodsZone ? "#6f9f54" : "#f5dfa2";
   const groundBottom = redwoodsZone ? "#3f4f31" : "#af8348";
   const pebbleTint = redwoodsZone ? "rgba(88, 114, 70, 0.42)" : "rgba(255, 232, 170, 0.5)";
 
@@ -3893,12 +5022,79 @@ function drawPlatforms() {
       }
     }
 
+    if (redwoodsZone) {
+      // Ground surface patchwork: mixed fallen leaves and grass.
+      for (let x = visibleStart - 6; x < visibleEnd + 6; x += 11) {
+        const worldX = x + Math.floor(cameraX);
+        const patchNoise = Math.sin(worldX * 0.09) + Math.cos(worldX * 0.041);
+        const patchY = plat.y + 3 + Math.floor(Math.abs(Math.sin(worldX * 0.071)) * 8);
+        const patchW = 5 + (Math.abs(Math.sin(worldX * 0.13)) * 4);
+        const patchH = 2 + (Math.abs(Math.cos(worldX * 0.1)) * 3);
+
+        if (patchNoise > 0.42) {
+          ctx.fillStyle = "rgba(104, 152, 79, 0.85)";
+        } else if (patchNoise < -0.16) {
+          ctx.fillStyle = "rgba(144, 100, 58, 0.86)";
+        } else {
+          ctx.fillStyle = "rgba(122, 130, 70, 0.58)";
+        }
+        ctx.fillRect(x, patchY, patchW, patchH);
+      }
+    }
+
     ctx.fillStyle = pebbleTint;
     for (let x = visibleStart; x < visibleEnd; x += 42) {
       const y = plat.y + 22 + ((x + Math.floor(cameraX)) % 3);
       ctx.fillRect(x, y, 6, 2);
     }
   }
+
+  const foundationTop = redwoodsZone ? "#c2a878" : "#d8bf8e";
+  const foundationBody = redwoodsZone ? "#8f724f" : "#9b7a53";
+  const foundationShade = redwoodsZone ? "#6e5237" : "#725537";
+
+  const zoneFoundations = getFoundationsForZone();
+  for (const foundation of zoneFoundations) {
+    const sx = Math.round(foundation.x - cameraX);
+    if (sx + foundation.w < -60 || sx > VIEW_WIDTH + 60) continue;
+
+    ctx.fillStyle = foundationBody;
+    ctx.fillRect(sx, foundation.y, foundation.w, foundation.h);
+    ctx.fillStyle = foundationTop;
+    ctx.fillRect(sx, foundation.y, foundation.w, 4);
+    ctx.fillStyle = foundationShade;
+    ctx.fillRect(sx, foundation.y + foundation.h - 4, foundation.w, 4);
+
+    ctx.strokeStyle = "rgba(62, 43, 24, 0.58)";
+    ctx.lineWidth = 1;
+    for (let x = sx + 8; x < sx + foundation.w - 4; x += 12) {
+      ctx.beginPath();
+      ctx.moveTo(x, foundation.y + 3);
+      ctx.lineTo(x, foundation.y + foundation.h - 3);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawFoundationPlacementPreview() {
+  if (player.dead || pauseMenuOpen || inventoryOpen || mapOpen || respawnMenuOpen) return;
+  if (getActiveTool() !== "foundation") return;
+  if (inventory.foundation <= 0) return;
+
+  const placeX = resolveFoundationPlacementX();
+  if (placeX === null) return;
+
+  const sx = Math.round(placeX - cameraX);
+  const sy = GROUND_Y - FOUNDATION_HEIGHT;
+
+  ctx.save();
+  ctx.fillStyle = "rgba(64, 190, 108, 0.24)";
+  ctx.strokeStyle = "rgba(140, 255, 182, 0.98)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 4]);
+  ctx.fillRect(sx, sy, FOUNDATION_WIDTH, FOUNDATION_HEIGHT);
+  ctx.strokeRect(sx, sy, FOUNDATION_WIDTH, FOUNDATION_HEIGHT);
+  ctx.restore();
 }
 
 function drawPlayer() {
@@ -4117,6 +5313,25 @@ function drawToolIcon(tool, x, y, size, muted = false) {
     ctx.lineTo(x + size * 0.4, y + size * 0.42);
     ctx.closePath();
     ctx.fill();
+    return;
+  }
+
+  if (tool === "foundation") {
+    const plank = muted ? "rgba(148, 120, 84, 0.58)" : "#ad8455";
+    const plankDark = muted ? "rgba(109, 83, 53, 0.52)" : "#7a5a38";
+    ctx.fillStyle = plank;
+    ctx.fillRect(x + size * 0.15, y + size * 0.5, size * 0.7, size * 0.28);
+    ctx.fillStyle = plankDark;
+    ctx.fillRect(x + size * 0.15, y + size * 0.72, size * 0.7, size * 0.08);
+    ctx.strokeStyle = plankDark;
+    ctx.lineWidth = Math.max(1, Math.floor(size * 0.05));
+    for (let i = 1; i < 4; i++) {
+      const px = x + size * (0.15 + i * 0.17);
+      ctx.beginPath();
+      ctx.moveTo(px, y + size * 0.52);
+      ctx.lineTo(px, y + size * 0.78);
+      ctx.stroke();
+    }
   }
 }
 
@@ -4166,9 +5381,14 @@ function drawMainMenu() {
   inputState.mainMenu.backButton = null;
   inputState.mainMenu.createWorldButton = null;
   inputState.mainMenu.worldButtons = [];
+  inputState.mainMenu.worldDeleteButtons = [];
+  inputState.mainMenu.worldListPanel = null;
+  inputState.mainMenu.worldScrollUpButton = null;
+  inputState.mainMenu.worldScrollDownButton = null;
   if (!googleAuthReady && hasGoogleClientId()) {
     tryInitGoogleAuth();
   }
+  const googleSignedIn = isGoogleSignedIn();
 
   ctx.fillStyle = "rgba(7, 16, 24, 0.52)";
   ctx.fillRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
@@ -4190,7 +5410,7 @@ function drawMainMenu() {
   ctx.fillText("2D ARK", panelX + panelW / 2, panelY + 68);
   ctx.font = "16px Trebuchet MS, Segoe UI, sans-serif";
   if (mainMenuScreen === MENU_HOME) {
-    ctx.fillText("Sign in with Google, then click Play", panelX + panelW / 2, panelY + 98);
+    ctx.fillText("Click Play to start. Google sign-in is optional.", panelX + panelW / 2, panelY + 98);
   } else if (mainMenuScreen === MENU_MODE) {
     ctx.fillText("Choose your game mode", panelX + panelW / 2, panelY + 98);
   } else {
@@ -4215,20 +5435,22 @@ function drawMainMenu() {
 
   ctx.fillStyle = "#5a3b1f";
   ctx.font = "16px Trebuchet MS, Segoe UI, sans-serif";
-  const accountText = signedInUser ? `Signed in: ${signedInUser}` : "Not signed in";
+  const accountText = googleSignedIn ? `Signed in: ${signedInUser}` : `Playing as ${getPlayerDisplayName()}`;
   ctx.fillText(accountText, panelX + panelW / 2, panelY + 188);
   ctx.font = "13px Trebuchet MS, Segoe UI, sans-serif";
-  const promptText = signedInUser ? "Google button: sign out" : "Google button: click once to sign in";
+  const promptText = googleSignedIn
+    ? "Google button: sign out"
+    : "Google button: sign in (required for multiplayer)";
   ctx.fillText(promptText, panelX + panelW / 2, panelY + 210);
 
   let statusY = panelY + 232;
   if (!hasGoogleAuthSupportedOrigin()) {
     ctx.fillStyle = "#6d2f1d";
-    ctx.fillText("Run on localhost/https for Google sign-in", panelX + panelW / 2, statusY);
+    ctx.fillText("Google sign-in needs localhost/https (required for multiplayer)", panelX + panelW / 2, statusY);
     statusY += 20;
   } else if (!hasGoogleClientId()) {
     ctx.fillStyle = "#6d2f1d";
-    ctx.fillText("Set GOOGLE_CLIENT_ID in index.html", panelX + panelW / 2, statusY);
+    ctx.fillText("Google sign-in not configured (multiplayer disabled)", panelX + panelW / 2, statusY);
     statusY += 20;
   }
   if (menuStatusText) {
@@ -4285,14 +5507,24 @@ function drawMainMenu() {
     ctx.font = "28px Trebuchet MS, Segoe UI, sans-serif";
     ctx.fillText("Single Player", singleButton.x + singleButton.w / 2, singleButton.y + 38);
 
-    ctx.fillStyle = "rgba(96, 92, 140, 0.95)";
+    const multiplayerEnabled = googleSignedIn;
+    ctx.fillStyle = multiplayerEnabled ? "rgba(96, 92, 140, 0.95)" : "rgba(112, 112, 112, 0.78)";
     ctx.fillRect(multiButton.x, multiButton.y, multiButton.w, multiButton.h);
-    ctx.strokeStyle = "#fff4de";
+    ctx.strokeStyle = multiplayerEnabled ? "#fff4de" : "rgba(255, 244, 222, 0.58)";
     ctx.lineWidth = 3;
     ctx.strokeRect(multiButton.x, multiButton.y, multiButton.w, multiButton.h);
-    ctx.fillStyle = "#fff4de";
+    ctx.fillStyle = multiplayerEnabled ? "#fff4de" : "rgba(255, 244, 222, 0.72)";
     ctx.font = "28px Trebuchet MS, Segoe UI, sans-serif";
     ctx.fillText("Multiplayer", multiButton.x + multiButton.w / 2, multiButton.y + 38);
+    if (!multiplayerEnabled) {
+      ctx.fillStyle = "#6d2f1d";
+      ctx.font = "12px Trebuchet MS, Segoe UI, sans-serif";
+      ctx.fillText("Sign in with Google to unlock multiplayer", multiButton.x + multiButton.w / 2, multiButton.y + 74);
+    } else {
+      ctx.fillStyle = "#5a3b1f";
+      ctx.font = "12px Trebuchet MS, Segoe UI, sans-serif";
+      ctx.fillText("Host creates an invite code. Join needs that code.", multiButton.x + multiButton.w / 2, multiButton.y + 74);
+    }
 
     ctx.fillStyle = "rgba(118, 86, 59, 0.92)";
     ctx.fillRect(backButton.x, backButton.y, backButton.w, backButton.h);
@@ -4329,26 +5561,88 @@ function drawMainMenu() {
 
     ctx.fillStyle = "#5a3b1f";
     ctx.font = "18px Trebuchet MS, Segoe UI, sans-serif";
-    ctx.fillText("World Saves", panelX + panelW / 2, panelY + 320);
+    ctx.fillText("World Saves", panelX + panelW / 2, panelY + 314);
 
-    const visibleWorlds = worldSaves.slice(0, MAX_WORLD_LIST_BUTTONS);
+    if (worldSaves.length > 0 && !worldSaves.some((world) => world.id === selectedWorldId)) {
+      selectedWorldId = worldSaves[0].id;
+    }
+    clampWorldListScroll();
+
+    const listPanel = {
+      x: panelX + 70,
+      y: panelY + 322,
+      w: 500,
+      h: 140
+    };
+    inputState.mainMenu.worldListPanel = listPanel;
+
+    ctx.fillStyle = "rgba(94, 74, 48, 0.36)";
+    ctx.fillRect(listPanel.x, listPanel.y, listPanel.w, listPanel.h);
+    ctx.strokeStyle = "#d8be8b";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(listPanel.x, listPanel.y, listPanel.w, listPanel.h);
+
+    const maxScroll = Math.max(0, worldSaves.length - MAX_WORLD_LIST_BUTTONS);
+    const scrollUpButton = {
+      x: listPanel.x + listPanel.w + 12,
+      y: listPanel.y,
+      w: 38,
+      h: 36
+    };
+    const scrollDownButton = {
+      x: listPanel.x + listPanel.w + 12,
+      y: listPanel.y + listPanel.h - 36,
+      w: 38,
+      h: 36
+    };
+    inputState.mainMenu.worldScrollUpButton = scrollUpButton;
+    inputState.mainMenu.worldScrollDownButton = scrollDownButton;
+
+    const canScrollUp = worldListScroll > 0;
+    const canScrollDown = worldListScroll < maxScroll;
+    ctx.fillStyle = canScrollUp ? "rgba(97, 134, 166, 0.92)" : "rgba(113, 113, 113, 0.55)";
+    ctx.fillRect(scrollUpButton.x, scrollUpButton.y, scrollUpButton.w, scrollUpButton.h);
+    ctx.fillStyle = canScrollDown ? "rgba(97, 134, 166, 0.92)" : "rgba(113, 113, 113, 0.55)";
+    ctx.fillRect(scrollDownButton.x, scrollDownButton.y, scrollDownButton.w, scrollDownButton.h);
+    ctx.strokeStyle = "#fff4de";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(scrollUpButton.x, scrollUpButton.y, scrollUpButton.w, scrollUpButton.h);
+    ctx.strokeRect(scrollDownButton.x, scrollDownButton.y, scrollDownButton.w, scrollDownButton.h);
+    ctx.fillStyle = "#fff4de";
+    ctx.font = "18px Trebuchet MS, Segoe UI, sans-serif";
+        ctx.fillText("^", scrollUpButton.x + scrollUpButton.w / 2, scrollUpButton.y + 24);
+        ctx.fillText("v", scrollDownButton.x + scrollDownButton.w / 2, scrollDownButton.y + 24);
+
+    const visibleWorlds = worldSaves.slice(worldListScroll, worldListScroll + MAX_WORLD_LIST_BUTTONS);
     if (visibleWorlds.length === 0) {
       ctx.fillStyle = "#5a3b1f";
       ctx.font = "14px Trebuchet MS, Segoe UI, sans-serif";
       ctx.fillText("No worlds yet. Click Create New World.", panelX + panelW / 2, panelY + 348);
     }
 
-    const rowH = 32;
+    const rowH = 30;
+    const rowGap = 3;
+    const deleteW = 56;
+    const playW = listPanel.w - deleteW - 12;
     for (let i = 0; i < visibleWorlds.length; i++) {
       const world = visibleWorlds[i];
+      const rowY = listPanel.y + 6 + i * (rowH + rowGap);
       const row = {
-        x: panelX + 70,
-        y: panelY + 326 + i * (rowH + 6),
-        w: 500,
+        x: listPanel.x + 6,
+        y: rowY,
+        w: playW,
+        h: rowH,
+        worldId: world.id
+      };
+      const deleteButton = {
+        x: row.x + playW + 6,
+        y: row.y,
+        w: deleteW,
         h: rowH,
         worldId: world.id
       };
       inputState.mainMenu.worldButtons.push(row);
+      inputState.mainMenu.worldDeleteButtons.push(deleteButton);
       const selected = world.id === selectedWorldId;
       ctx.fillStyle = selected ? "rgba(255, 226, 156, 0.92)" : "rgba(104, 82, 52, 0.78)";
       ctx.fillRect(row.x, row.y, row.w, row.h);
@@ -4358,12 +5652,31 @@ function drawMainMenu() {
 
       const updatedText = world.updatedAt ? new Date(world.updatedAt).toLocaleDateString() : "Never";
       ctx.fillStyle = selected ? "#5a3b1f" : "#fff4de";
-      ctx.font = "15px Trebuchet MS, Segoe UI, sans-serif";
+      ctx.font = "13px Trebuchet MS, Segoe UI, sans-serif";
       ctx.textAlign = "left";
-      ctx.fillText(world.name, row.x + 10, row.y + 22);
+      ctx.fillText(world.name, row.x + 10, row.y + 20);
       ctx.textAlign = "right";
+      ctx.font = "10px Trebuchet MS, Segoe UI, sans-serif";
+      ctx.fillText(`Saved: ${updatedText}`, row.x + row.w - 10, row.y + 19);
+      ctx.textAlign = "center";
+
+      ctx.fillStyle = "rgba(146, 70, 58, 0.92)";
+      ctx.fillRect(deleteButton.x, deleteButton.y, deleteButton.w, deleteButton.h);
+      ctx.strokeStyle = "#ffd8cf";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(deleteButton.x, deleteButton.y, deleteButton.w, deleteButton.h);
+      ctx.fillStyle = "#fff1eb";
       ctx.font = "11px Trebuchet MS, Segoe UI, sans-serif";
-      ctx.fillText(`Saved: ${updatedText}`, row.x + row.w - 10, row.y + 21);
+      ctx.fillText("Delete", deleteButton.x + deleteButton.w / 2, deleteButton.y + 19);
+    }
+
+    if (worldSaves.length > 0) {
+      const start = worldListScroll + 1;
+      const end = worldListScroll + visibleWorlds.length;
+      ctx.fillStyle = "#5a3b1f";
+      ctx.font = "11px Trebuchet MS, Segoe UI, sans-serif";
+      ctx.textAlign = "right";
+      ctx.fillText(`${start}-${end} of ${worldSaves.length}`, listPanel.x + listPanel.w, panelY + 314);
       ctx.textAlign = "center";
     }
 
@@ -4589,7 +5902,7 @@ function drawMapOverlay() {
   drawTravelButton(
     redwoodsButton,
     "Redwoods",
-    "47.5% P 47.5% R 5% Thyla",
+    "24.75% P/R/G/T + 1% Rex",
     currentZone === ZONE_REDWOODS,
     "rgba(76, 120, 84, 0.9)"
   );
@@ -4627,6 +5940,7 @@ function drawInventory() {
   ui.clearSelectedButton = null;
   ui.craftPickaxeButton = null;
   ui.craftAxeButton = null;
+  ui.craftFoundationButton = null;
 
   const panelW = 760;
   const panelH = 390;
@@ -4679,6 +5993,7 @@ function drawInventory() {
 
   const resources = [
     { label: "Thatch", value: inventory.thatch, color: "#d5bf82" },
+    { label: "Fiber", value: inventory.fiber, color: "#7cad64" },
     { label: "Wood", value: inventory.wood, color: "#9a6938" },
     { label: "Stone", value: inventory.stone, color: "#9aa1ad" },
     { label: "Flint", value: inventory.flint, color: "#cdd2da" },
@@ -4687,7 +6002,7 @@ function drawInventory() {
   ctx.font = "14px Trebuchet MS, Segoe UI, sans-serif";
   for (let i = 0; i < resources.length; i++) {
     const item = resources[i];
-    const rowY = bagY + 52 + i * 23;
+    const rowY = bagY + 52 + i * 19;
     ctx.fillStyle = item.color;
     ctx.fillRect(bagX + 14, rowY - 11, 12, 12);
     ctx.fillStyle = "#5a3b1f";
@@ -4696,13 +6011,14 @@ function drawInventory() {
 
   const toolDefs = [
     { id: "hands", label: "Hands", owned: true },
-    { id: "pickaxe", label: "Stone Pickaxe", owned: inventory.pickaxe },
-    { id: "axe", label: "Stone Axe", owned: inventory.axe }
+    { id: "pickaxe", label: "Pickaxe", owned: inventory.pickaxe > 0 },
+    { id: "axe", label: "Axe", owned: inventory.axe > 0 },
+    { id: "foundation", label: "Foundation", owned: inventory.foundation > 0 }
   ];
-  const toolBtnW = 92;
+  const toolBtnW = 72;
   const toolBtnH = 84;
-  const toolGap = 10;
-  const toolStartX = bagX + 10;
+  const toolGap = 8;
+  const toolStartX = bagX + 8;
   const toolY = bagY + 152;
 
   for (let i = 0; i < toolDefs.length; i++) {
@@ -4718,11 +6034,20 @@ function drawInventory() {
     ctx.strokeStyle = selected ? "#ffe4b8" : "#b78a52";
     ctx.lineWidth = selected ? 3 : 2;
     ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
-    drawToolIcon(tool.id, rect.x + 22, rect.y + 14, 46, muted);
+    drawToolIcon(tool.id, rect.x + 16, rect.y + 14, 38, muted);
     ctx.fillStyle = muted ? "#8c7b63" : "#5a3b1f";
-    ctx.font = "12px Trebuchet MS, Segoe UI, sans-serif";
+    ctx.font = "11px Trebuchet MS, Segoe UI, sans-serif";
     ctx.fillText(tool.label, rect.x + 8, rect.y + 68);
-    if (!tool.owned) {
+    if (tool.id !== "hands") {
+      const qty = getToolCount(tool.id);
+      if (qty > 0) {
+        ctx.fillStyle = "#2e7a44";
+        ctx.fillText(`Qty: ${qty}`, rect.x + 8, rect.y + 81);
+      } else {
+        ctx.fillStyle = "#a84c3d";
+        ctx.fillText("Not Crafted", rect.x + 8, rect.y + 81);
+      }
+    } else if (!tool.owned) {
       ctx.fillStyle = "#a84c3d";
       ctx.fillText("Not Crafted", rect.x + 8, rect.y + 81);
     }
@@ -4733,9 +6058,9 @@ function drawInventory() {
   ctx.font = "13px Trebuchet MS, Segoe UI, sans-serif";
   ctx.fillText(`Selected Tool: ${selectedLabel}`, bagX + 14, bagY + bagH - 14);
 
-  const recipeCardW = 176;
+  const recipeCardW = 118;
   const recipeCardH = 208;
-  const recipeGap = 14;
+  const recipeGap = 10;
   const recipeStartX = craftX + 12;
   const recipeY = craftY + 36;
   const recipeCards = [
@@ -4745,8 +6070,8 @@ function drawInventory() {
       y: recipeY,
       w: recipeCardW,
       h: recipeCardH,
-      title: "Stone Pickaxe",
-      owned: inventory.pickaxe,
+      title: "Pickaxe",
+      quantity: inventory.pickaxe,
       canCraft: canCraftPickaxe(),
       requirements: [
         { label: "Stone", have: inventory.stone, need: 3 },
@@ -4760,14 +6085,29 @@ function drawInventory() {
       y: recipeY,
       w: recipeCardW,
       h: recipeCardH,
-      title: "Stone Axe",
-      owned: inventory.axe,
+      title: "Axe",
+      quantity: inventory.axe,
       canCraft: canCraftAxe(),
       requirements: [
         { label: "Flint", have: inventory.flint, need: 3 },
         { label: "Stone", have: inventory.stone, need: 2 },
         { label: "Thatch", have: inventory.thatch, need: 10 },
         { label: "Wood", have: inventory.wood, need: 1 }
+      ]
+    },
+    {
+      id: "foundation",
+      x: recipeStartX + (recipeCardW + recipeGap) * 2,
+      y: recipeY,
+      w: recipeCardW,
+      h: recipeCardH,
+      title: "Foundation",
+      quantity: inventory.foundation,
+      canCraft: canCraftFoundation(),
+      requirements: [
+        { label: "Wood", have: inventory.wood, need: 20 },
+        { label: "Thatch", have: inventory.thatch, need: 50 },
+        { label: "Fiber", have: inventory.fiber, need: 40 }
       ]
     }
   ];
@@ -4781,30 +6121,33 @@ function drawInventory() {
     ctx.strokeRect(card.x, card.y, card.w, card.h);
 
     ctx.fillStyle = "#5a3b1f";
-    ctx.font = "16px Trebuchet MS, Segoe UI, sans-serif";
+    ctx.font = "14px Trebuchet MS, Segoe UI, sans-serif";
     ctx.fillText(card.title, card.x + 10, card.y + 22);
-    ctx.font = "12px Trebuchet MS, Segoe UI, sans-serif";
+    ctx.font = "11px Trebuchet MS, Segoe UI, sans-serif";
+    ctx.fillText(`Owned: ${card.quantity}`, card.x + 10, card.y + 36);
+    ctx.font = "11px Trebuchet MS, Segoe UI, sans-serif";
     for (let i = 0; i < card.requirements.length; i++) {
       const req = card.requirements[i];
       const enough = req.have >= req.need;
       ctx.fillStyle = enough ? "#2e7a44" : "#a84c3d";
-      ctx.fillText(`${req.label}: ${req.have}/${req.need}`, card.x + 10, card.y + 44 + i * 18);
+      ctx.fillText(`${req.label}: ${req.have}/${req.need}`, card.x + 10, card.y + 58 + i * 16);
     }
 
-    const button = { x: card.x + 10, y: card.y + card.h - 36, w: card.w - 20, h: 26 };
+    const button = { x: card.x + 8, y: card.y + card.h - 36, w: card.w - 16, h: 26 };
     if (card.id === "pickaxe") ui.craftPickaxeButton = button;
     if (card.id === "axe") ui.craftAxeButton = button;
-    ctx.fillStyle = card.owned ? "#8f9ba8" : (card.canCraft ? "#3c8d57" : "#8b6d47");
+    if (card.id === "foundation") ui.craftFoundationButton = button;
+    ctx.fillStyle = card.canCraft ? "#3c8d57" : "#8b6d47";
     ctx.fillRect(button.x, button.y, button.w, button.h);
     ctx.strokeStyle = "#fff4de";
     ctx.lineWidth = 2;
     ctx.strokeRect(button.x, button.y, button.w, button.h);
     ctx.fillStyle = "#fff4de";
-    ctx.font = "13px Trebuchet MS, Segoe UI, sans-serif";
-    const buttonText = card.owned ? "Crafted" : (selected ? "Craft [C]" : "Select + Craft");
-    ctx.fillText(buttonText, button.x + 42, button.y + 17);
+    ctx.font = "12px Trebuchet MS, Segoe UI, sans-serif";
+    const buttonText = selected ? "Craft [C]" : "Select + Craft";
+    ctx.fillText(buttonText, button.x + 16, button.y + 17);
 
-    drawToolIcon(card.id, card.x + card.w - 44, card.y + card.h - 86, 32, !card.owned);
+    drawToolIcon(card.id, card.x + card.w - 38, card.y + card.h - 86, 28, card.quantity <= 0);
   }
 
   const slotSize = 52;
@@ -4909,17 +6252,22 @@ function frame(now) {
   drawBackground();
   drawPlatforms();
   drawPebbles(interactionTarget);
+  drawBushes(interactionTarget, false);
   drawTrees(interactionTarget);
   drawRedwoodProps();
+  drawBushes(interactionTarget, true);
   drawStones(interactionTarget);
   drawParasaurs(interactionTarget);
+  drawGallimimus(interactionTarget);
   drawTriceratops(interactionTarget);
   drawDodos(interactionTarget);
   drawDilophosaurs(interactionTarget);
   drawRaptors(interactionTarget);
   drawThylacoleos(interactionTarget);
+  drawTrexes(interactionTarget);
   drawRemotePlayers();
   drawPlayer();
+  drawFoundationPlacementPreview();
   drawInteractionPrompt(interactionTarget);
   drawHud();
   drawHotbar();

@@ -1,7 +1,9 @@
 "use strict";
 
 const fs = require("fs");
+const http = require("http");
 const path = require("path");
+const url = require("url");
 const { WebSocket, WebSocketServer } = require("ws");
 
 const PORT = Number(process.env.PORT) || 8080;
@@ -9,6 +11,7 @@ const HOST = process.env.HOST || "0.0.0.0";
 const SAVE_FILE = process.env.MULTIPLAYER_SAVE_FILE
   ? path.resolve(process.env.MULTIPLAYER_SAVE_FILE)
   : path.join(__dirname, "multiplayer-worlds.json");
+const STATIC_ROOT = __dirname;
 
 const BEACH_SPAWN_X = 80;
 const REDWOODS_SPAWN_X = 1180;
@@ -22,6 +25,21 @@ const ZONE_REDWOODS = "redwoods";
 const worlds = new Map();
 const sessionsBySocket = new Map();
 let saveTimer = null;
+
+const MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".mp3": "audio/mpeg",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".txt": "text/plain; charset=utf-8"
+};
 
 function clampNumber(value, min, max, fallback) {
   const parsed = Number(value);
@@ -40,7 +58,7 @@ function normalizeZone(zone) {
 }
 
 function normalizeTool(tool) {
-  return tool === "hands" || tool === "pickaxe" || tool === "axe" ? tool : null;
+  return tool === "hands" || tool === "pickaxe" || tool === "axe" || tool === "foundation" ? tool : null;
 }
 
 function normalizeWorldName(name, index = 0) {
@@ -54,7 +72,7 @@ function normalizeWorldId(worldId) {
   if (typeof worldId !== "string") return "";
   const trimmed = worldId.trim().toUpperCase();
   if (!trimmed) return "";
-  if (!/^[A-Z0-9_-]{2,20}$/.test(trimmed)) return "";
+  if (!new RegExp(`^[A-Z0-9]{${WORLD_CODE_LENGTH}}$`).test(trimmed)) return "";
   return trimmed;
 }
 
@@ -77,12 +95,14 @@ function createDefaultCharacterData() {
     zone: ZONE_BEACH,
     inventory: {
       thatch: 0,
+      fiber: 0,
       wood: 0,
       stone: 0,
       flint: 0,
       metal: 0,
-      pickaxe: false,
-      axe: false
+      pickaxe: 0,
+      axe: 0,
+      foundation: 0
     },
     hotbar: {
       slots: ["hands", null, null, null, null],
@@ -101,6 +121,10 @@ function normalizeCharacterData(data) {
   const source = data && typeof data === "object" ? data : {};
   const sourceInventory = source.inventory && typeof source.inventory === "object" ? source.inventory : {};
   const sourceHotbar = source.hotbar && typeof source.hotbar === "object" ? source.hotbar : {};
+  const normalizeToolCount = (value) => {
+    if (value === true) return 1;
+    return clampResource(value);
+  };
 
   const normalizedSlots = [];
   for (let i = 0; i < defaults.hotbar.slots.length; i++) {
@@ -119,19 +143,21 @@ function normalizeCharacterData(data) {
     zone: normalizeZone(source.zone),
     inventory: {
       thatch: clampResource(sourceInventory.thatch),
+      fiber: clampResource(sourceInventory.fiber),
       wood: clampResource(sourceInventory.wood),
       stone: clampResource(sourceInventory.stone),
       flint: clampResource(sourceInventory.flint),
       metal: clampResource(sourceInventory.metal),
-      pickaxe: !!sourceInventory.pickaxe,
-      axe: !!sourceInventory.axe
+      pickaxe: normalizeToolCount(sourceInventory.pickaxe),
+      axe: normalizeToolCount(sourceInventory.axe),
+      foundation: normalizeToolCount(sourceInventory.foundation)
     },
     hotbar: {
       slots: normalizedSlots,
       selected: selectedSlot
     },
-    craftSelection: source.craftSelection === "axe" ? "axe" : "pickaxe",
-    selectedInventoryTool: source.selectedInventoryTool === "pickaxe" || source.selectedInventoryTool === "axe"
+    craftSelection: source.craftSelection === "axe" || source.craftSelection === "foundation" ? source.craftSelection : "pickaxe",
+    selectedInventoryTool: source.selectedInventoryTool === "pickaxe" || source.selectedInventoryTool === "axe" || source.selectedInventoryTool === "foundation"
       ? source.selectedInventoryTool
       : "hands",
     trees: [],
@@ -295,6 +321,96 @@ function sendErrorAndClose(socket, message) {
   }
 }
 
+function writeJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Content-Length": Buffer.byteLength(body)
+  });
+  res.end(body);
+}
+
+function sendFile(res, filePath) {
+  let stats = null;
+  try {
+    stats = fs.statSync(filePath);
+  } catch {
+    writeJson(res, 404, { error: "Not found" });
+    return;
+  }
+  if (!stats.isFile()) {
+    writeJson(res, 404, { error: "Not found" });
+    return;
+  }
+
+  const extension = path.extname(filePath).toLowerCase();
+  const contentType = MIME_TYPES[extension] || "application/octet-stream";
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Length": stats.size
+  });
+  fs.createReadStream(filePath).pipe(res);
+}
+
+function handleHttpRequest(req, res) {
+  const method = String(req.method || "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    writeJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  const parsed = url.parse(req.url || "/", false);
+  let pathname = "/";
+  try {
+    pathname = decodeURIComponent(parsed.pathname || "/");
+  } catch {
+    writeJson(res, 400, { error: "Bad request" });
+    return;
+  }
+  if (pathname === "/health") {
+    writeJson(res, 200, {
+      ok: true,
+      worlds: worlds.size,
+      uptimeSeconds: Math.floor(process.uptime())
+    });
+    return;
+  }
+
+  const relativePath = pathname === "/"
+    ? "index.html"
+    : pathname.replace(/^\/+/, "");
+  const absolutePath = path.resolve(STATIC_ROOT, relativePath);
+  if (!absolutePath.startsWith(STATIC_ROOT)) {
+    writeJson(res, 403, { error: "Forbidden" });
+    return;
+  }
+
+  if (method === "HEAD") {
+    let stats = null;
+    try {
+      stats = fs.statSync(absolutePath);
+    } catch {
+      writeJson(res, 404, { error: "Not found" });
+      return;
+    }
+    if (!stats.isFile()) {
+      writeJson(res, 404, { error: "Not found" });
+      return;
+    }
+    const extension = path.extname(absolutePath).toLowerCase();
+    const contentType = MIME_TYPES[extension] || "application/octet-stream";
+    res.writeHead(200, {
+      "Content-Type": contentType,
+      "Content-Length": stats.size
+    });
+    res.end();
+    return;
+  }
+
+  sendFile(res, absolutePath);
+}
+
 function sessionToNetworkPlayer(session) {
   return {
     playerId: session.playerId,
@@ -356,7 +472,7 @@ function handleHello(socket, message) {
   } else {
     const worldId = normalizeWorldId(message?.worldId);
     if (!worldId || !worlds.has(worldId)) {
-      sendErrorAndClose(socket, "World code not found.");
+      sendErrorAndClose(socket, "Invite code not found.");
       return false;
     }
     world = worlds.get(worldId);
@@ -457,7 +573,10 @@ function handleMessage(socket, rawData) {
 
 loadWorldsFromDisk();
 
-const wss = new WebSocketServer({ port: PORT, host: HOST });
+const httpServer = http.createServer((req, res) => {
+  handleHttpRequest(req, res);
+});
+const wss = new WebSocketServer({ server: httpServer });
 
 wss.on("connection", (socket) => {
   socket.on("message", (data) => {
@@ -474,9 +593,12 @@ wss.on("connection", (socket) => {
 });
 
 const hostLabel = HOST === "0.0.0.0" ? "localhost" : HOST;
-console.log(`[multiplayer] websocket server running on ws://${hostLabel}:${PORT}`);
-console.log(`[multiplayer] save file: ${SAVE_FILE}`);
-console.log(`[multiplayer] loaded worlds: ${worlds.size}`);
+httpServer.listen(PORT, HOST, () => {
+  console.log(`[multiplayer] server running on http://${hostLabel}:${PORT}`);
+  console.log(`[multiplayer] websocket endpoint: ws://${hostLabel}:${PORT}`);
+  console.log(`[multiplayer] save file: ${SAVE_FILE}`);
+  console.log(`[multiplayer] loaded worlds: ${worlds.size}`);
+});
 
 function shutdown(signal) {
   if (saveTimer !== null) {
