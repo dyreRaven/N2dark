@@ -45,6 +45,7 @@ let multiplayerSendTimer = 0;
 let multiplayerSaveTimer = 0;
 let suppressMultiplayerCloseNotice = false;
 let multiplayerHadServerError = false;
+let pendingMultiplayerConnection = null;
 const remotePlayers = new Map();
 
 const PLAYER_SPAWN_X = 80;
@@ -68,6 +69,8 @@ const MENU_MODE = "mode";
 const MENU_SINGLEPLAYER = "singleplayer";
 const MENU_MULTIPLAYER = "multiplayer";
 const MULTIPLAYER_INVITE_CODE_LENGTH = 6;
+const WORLD_MENU_PLAY = "play";
+const WORLD_MENU_HOST = "host";
 let mainMenuScreen = MENU_HOME;
 let worldListScroll = 0;
 const MULTIPLAYER_LAST_SERVER_KEY = "ark2d_last_multiplayer_server";
@@ -76,6 +79,7 @@ const MULTIPLAYER_SAVE_INTERVAL = 3;
 let guestProfile = null;
 let multiplayerInviteInput = "";
 let multiplayerInviteFocused = false;
+let worldMenuMode = WORLD_MENU_PLAY;
 
 const inputState = {
   hotbarSlotRects: [],
@@ -153,6 +157,7 @@ const METAL_NODE_HEALTH = 7;
 const METAL_NODE_CHANCE = 0.1;
 const NPC_ATTACK_COOLDOWN = 1;
 const RAPTOR_ATTACK_COOLDOWN = 0.7;
+const DINO_ATTACK_WINDUP_SECONDS = 0.5;
 const THYLACOLEO_POUNCE_STUN_SECONDS = 5;
 const BACKGROUND_MUSIC_FILE = "Spiring - City Life (freetouse.com).mp3";
 const DAMAGE_MUSIC_FILE = "Conquest - Blacksmith (freetouse.com).mp3";
@@ -827,6 +832,7 @@ function startGameWithWorld(worldId) {
   } else {
     clearMultiplayerState();
   }
+  pendingMultiplayerConnection = null;
   selectedWorldId = world.id;
   activeWorldId = world.id;
   applyWorldDataToGame(world.data);
@@ -848,6 +854,7 @@ function startGameWithWorld(worldId) {
   saveCurrentWorld(true);
   lastTime = performance.now();
   tryStartBackgroundMusic();
+  worldMenuMode = WORLD_MENU_PLAY;
 }
 
 function createNewWorld() {
@@ -894,6 +901,30 @@ function captureCharacterDataFromGame() {
     craftSelection,
     selectedInventoryTool
   });
+}
+
+function captureCharacterDataFromWorld(world) {
+  const normalized = normalizeWorldData(world?.data || createDefaultWorldData());
+  return {
+    zone: normalized.zone,
+    inventory: {
+      thatch: normalized.inventory.thatch,
+      fiber: normalized.inventory.fiber,
+      wood: normalized.inventory.wood,
+      stone: normalized.inventory.stone,
+      flint: normalized.inventory.flint,
+      metal: normalized.inventory.metal,
+      pickaxe: normalized.inventory.pickaxe,
+      axe: normalized.inventory.axe,
+      foundation: normalized.inventory.foundation
+    },
+    hotbar: {
+      slots: normalized.hotbar.slots.slice(),
+      selected: normalized.hotbar.selected
+    },
+    craftSelection: normalized.craftSelection,
+    selectedInventoryTool: normalized.selectedInventoryTool
+  };
 }
 
 function applyCharacterDataToGame(data) {
@@ -1027,6 +1058,32 @@ function getMultiplayerServerCandidates() {
   return candidates;
 }
 
+function beginMultiplayerConnectionWithCandidates(mode, candidates, worldId, worldName, characterDataOverride = null) {
+  const list = Array.isArray(candidates)
+    ? candidates
+      .filter((value) => typeof value === "string" && value.trim())
+      .map((value) => value.trim())
+    : [];
+  if (list.length === 0) {
+    pendingMultiplayerConnection = null;
+    setMenuStatus("No multiplayer server URL available.");
+    return;
+  }
+
+  pendingMultiplayerConnection = {
+    mode,
+    candidates: list,
+    nextIndex: 1,
+    worldId: worldId || "",
+    worldName: worldName || "",
+    characterData: characterDataOverride && typeof characterDataOverride === "object"
+      ? characterDataOverride
+      : null
+  };
+
+  beginMultiplayerConnection(mode, list[0], worldId, worldName, characterDataOverride);
+}
+
 function hasOpenMultiplayerConnection() {
   return !!(multiplayerSocket && multiplayerSocket.readyState === WebSocket.OPEN && multiplayerConnected);
 }
@@ -1157,6 +1214,7 @@ function startMultiplayerGameSession(characterData) {
   multiplayerSendTimer = MULTIPLAYER_SEND_INTERVAL;
   multiplayerSaveTimer = MULTIPLAYER_SAVE_INTERVAL;
   mainMenuScreen = MENU_HOME;
+  worldMenuMode = WORLD_MENU_PLAY;
   lastTime = performance.now();
   tryStartBackgroundMusic();
   sendMultiplayerCharacterSave();
@@ -1174,12 +1232,14 @@ function handleMultiplayerServerMessage(rawData) {
 
   if (message.type === "error") {
     multiplayerHadServerError = true;
+    pendingMultiplayerConnection = null;
     setMenuStatus(typeof message.message === "string" ? message.message : "Multiplayer error.");
     return;
   }
 
   if (message.type === "welcome") {
     multiplayerConnected = true;
+    pendingMultiplayerConnection = null;
     multiplayerWorldId = typeof message.worldId === "string" ? message.worldId : "";
     multiplayerWorldName = typeof message.worldName === "string" ? message.worldName : multiplayerWorldId;
     multiplayerPlayerId = typeof message.playerId === "string" ? message.playerId : "";
@@ -1216,7 +1276,7 @@ function handleMultiplayerServerMessage(rawData) {
   }
 }
 
-function beginMultiplayerConnection(mode, serverUrl, worldId, worldName) {
+function beginMultiplayerConnection(mode, serverUrl, worldId, worldName, characterDataOverride = null) {
   if (!isGoogleSignedIn()) {
     setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
     return;
@@ -1238,7 +1298,22 @@ function beginMultiplayerConnection(mode, serverUrl, worldId, worldName) {
   try {
     ws = new WebSocket(url);
   } catch {
-    setMenuStatus("Invalid server URL.");
+    const retryPlan = pendingMultiplayerConnection;
+    if (retryPlan && retryPlan.nextIndex < retryPlan.candidates.length) {
+      const nextServerUrl = retryPlan.candidates[retryPlan.nextIndex];
+      retryPlan.nextIndex += 1;
+      setMenuStatus(`Retrying multiplayer on ${nextServerUrl}...`);
+      beginMultiplayerConnection(
+        retryPlan.mode,
+        nextServerUrl,
+        retryPlan.worldId,
+        retryPlan.worldName,
+        retryPlan.characterData
+      );
+      return;
+    }
+    pendingMultiplayerConnection = null;
+    setMenuStatus("Invalid multiplayer server URL.");
     return;
   }
 
@@ -1249,13 +1324,16 @@ function beginMultiplayerConnection(mode, serverUrl, worldId, worldName) {
 
   ws.addEventListener("open", () => {
     saveLastMultiplayerServerUrl(url);
+    const characterData = characterDataOverride && typeof characterDataOverride === "object"
+      ? characterDataOverride
+      : captureCharacterDataFromGame();
     sendMultiplayerMessage("hello", {
       mode,
       worldId: multiplayerWorldId,
       worldName: multiplayerWorldName,
       playerKey: getPlayerIdentityKey(),
       displayName: getPlayerDisplayName(),
-      characterData: captureCharacterDataFromGame()
+      characterData
     }, false);
     setMenuStatus("Waiting for server...");
   });
@@ -1285,17 +1363,34 @@ function beginMultiplayerConnection(mode, serverUrl, worldId, worldName) {
     clearMultiplayerState();
     if (suppressNotice) return;
     if (wasInMultiplayerGame) {
+      pendingMultiplayerConnection = null;
       gameStarted = false;
       pauseMenuOpen = false;
       inventoryOpen = false;
       mapOpen = false;
       keys.clear();
       mainMenuScreen = MENU_HOME;
+      worldMenuMode = WORLD_MENU_PLAY;
       setMenuStatus("Disconnected from multiplayer.");
       lastTime = performance.now();
     } else if (!gameStarted) {
+      const retryPlan = pendingMultiplayerConnection;
+      if (!hadServerError && retryPlan && retryPlan.nextIndex < retryPlan.candidates.length) {
+        const nextServerUrl = retryPlan.candidates[retryPlan.nextIndex];
+        retryPlan.nextIndex += 1;
+        setMenuStatus(`Retrying multiplayer on ${nextServerUrl}...`);
+        beginMultiplayerConnection(
+          retryPlan.mode,
+          nextServerUrl,
+          retryPlan.worldId,
+          retryPlan.worldName,
+          retryPlan.characterData
+        );
+        return;
+      }
+      pendingMultiplayerConnection = null;
       if (!hadServerError) {
-        setMenuStatus("Could not connect. Start server with npm start, then open http://localhost:8080.");
+        setMenuStatus("Could not connect to multiplayer server. Start it with npm start or verify server URL.");
       }
     }
   });
@@ -1309,11 +1404,23 @@ function getSanitizedInviteCode(rawValue) {
     .slice(0, MULTIPLAYER_INVITE_CODE_LENGTH);
 }
 
+function openSingleplayerWorldMenu(mode = WORLD_MENU_PLAY) {
+  worldMenuMode = mode === WORLD_MENU_HOST ? WORLD_MENU_HOST : WORLD_MENU_PLAY;
+  mainMenuScreen = MENU_SINGLEPLAYER;
+  multiplayerInviteFocused = false;
+  clampWorldListScroll();
+  if (worldSaves.length > 0 && !worldSaves.some((world) => world.id === selectedWorldId)) {
+    selectedWorldId = worldSaves[0].id;
+  }
+}
+
 function openMultiplayerMenu() {
   if (!isGoogleSignedIn()) {
     setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
     return;
   }
+  pendingMultiplayerConnection = null;
+  worldMenuMode = WORLD_MENU_PLAY;
   mainMenuScreen = MENU_MULTIPLAYER;
   multiplayerInviteInput = getSanitizedInviteCode(multiplayerWorldId || multiplayerInviteInput);
   multiplayerInviteFocused = true;
@@ -1335,7 +1442,7 @@ function joinMultiplayerFromInviteInput() {
     setMenuStatus("No multiplayer server URL available.");
     return;
   }
-  beginMultiplayerConnection("join", candidates[0], worldId, "");
+  beginMultiplayerConnectionWithCandidates("join", candidates, worldId, "");
 }
 
 function hostMultiplayerFromMenu() {
@@ -1343,13 +1450,32 @@ function hostMultiplayerFromMenu() {
     setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
     return;
   }
+  openSingleplayerWorldMenu(WORLD_MENU_HOST);
+  multiplayerInviteFocused = false;
+  setMenuStatus("Pick a world to host in multiplayer.");
+}
+
+function hostMultiplayerWithWorld(worldId) {
+  if (!isGoogleSignedIn()) {
+    setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
+    mainMenuScreen = MENU_MULTIPLAYER;
+    worldMenuMode = WORLD_MENU_PLAY;
+    return;
+  }
+  const world = getWorldById(worldId);
+  if (!world) {
+    setMenuStatus("Select or create a world first.");
+    return;
+  }
   const candidates = getMultiplayerServerCandidates();
   if (candidates.length === 0) {
     setMenuStatus("No multiplayer server URL available.");
     return;
   }
-  const worldName = normalizeWorldName(`World ${worldSaves.length + 1}`, worldSaves.length);
-  beginMultiplayerConnection("host", candidates[0], "", worldName);
+  selectedWorldId = world.id;
+  const worldName = normalizeWorldName(world.name, worldSaves.length);
+  const characterData = captureCharacterDataFromWorld(world);
+  beginMultiplayerConnectionWithCandidates("host", candidates, "", worldName, characterData);
 }
 
 function hostCurrentWorldFromGame() {
@@ -1387,7 +1513,10 @@ function hostCurrentWorldFromGame() {
     activeWorld?.name || `World ${worldSaves.length + 1}`,
     worldSaves.length
   );
-  beginMultiplayerConnection("host", candidates[0], "", worldName);
+  if (activeWorldId) {
+    saveCurrentWorld(true);
+  }
+  beginMultiplayerConnectionWithCandidates("host", candidates, "", worldName, captureCharacterDataFromGame());
 }
 
 const DEFAULT_TREE_XS = [188, 472, 739, 1096, 1418, 1763, 2311];
@@ -1769,6 +1898,8 @@ function createDinoAtSpawn(spawn, forcedType = null, zone = currentZone) {
     respawnTimer: 0,
     fleeTimer: 0,
     attackCooldown: 0,
+    attackPending: false,
+    attackWindup: 0,
     attackDamage: 0,
     attackInterval: NPC_ATTACK_COOLDOWN,
     attackReachX: 0,
@@ -1778,6 +1909,7 @@ function createDinoAtSpawn(spawn, forcedType = null, zone = currentZone) {
     treePerchX: 0,
     treePerchY: 0,
     pounceStunArmed: false,
+    pounceStunPending: false,
     aggroTimer: 0,
     anim: Math.random() * Math.PI * 2
   };
@@ -2388,7 +2520,9 @@ function dealDamageToPlayer(amount) {
 }
 
 function startGame() {
+  pendingMultiplayerConnection = null;
   mainMenuScreen = MENU_MODE;
+  worldMenuMode = WORLD_MENU_PLAY;
 }
 
 function returnToTitleScreen() {
@@ -2409,6 +2543,7 @@ function returnToTitleScreen() {
 
   gameStarted = false;
   mainMenuScreen = MENU_HOME;
+  worldMenuMode = WORLD_MENU_PLAY;
   pauseMenuOpen = false;
   mapOpen = false;
   inventoryOpen = false;
@@ -2452,7 +2587,7 @@ function handleMainMenuClick(mouseX, mouseY) {
 
   if (mainMenuScreen === MENU_MODE) {
     if (pointInRect(mouseX, mouseY, inputState.mainMenu.singleplayerButton)) {
-      mainMenuScreen = MENU_SINGLEPLAYER;
+      openSingleplayerWorldMenu(WORLD_MENU_PLAY);
       return;
     }
     if (pointInRect(mouseX, mouseY, inputState.mainMenu.multiplayerButton)) {
@@ -2520,11 +2655,20 @@ function handleMainMenuClick(mouseX, mouseY) {
     for (const worldButton of inputState.mainMenu.worldButtons) {
       if (!pointInRect(mouseX, mouseY, worldButton)) continue;
       selectedWorldId = worldButton.worldId;
-      startGameWithWorld(worldButton.worldId);
+      if (worldMenuMode === WORLD_MENU_HOST) {
+        hostMultiplayerWithWorld(worldButton.worldId);
+      } else {
+        startGameWithWorld(worldButton.worldId);
+      }
       return;
     }
     if (pointInRect(mouseX, mouseY, inputState.mainMenu.backButton)) {
-      mainMenuScreen = MENU_MODE;
+      if (worldMenuMode === WORLD_MENU_HOST) {
+        worldMenuMode = WORLD_MENU_PLAY;
+        mainMenuScreen = MENU_MULTIPLAYER;
+      } else {
+        mainMenuScreen = MENU_MODE;
+      }
       return;
     }
   }
@@ -3254,6 +3398,53 @@ function patrolDinoHomeArea(dino, dt, calmSpeedMultiplier = 1, returnSpeedMultip
   moveGroundDino(dino, dino.dir * dino.speed * calmSpeedMultiplier * dt);
 }
 
+function isPlayerInDinoAttackRange(dino, playerCenterX, playerCenterY, reachX = dino.attackReachX, reachY = dino.attackReachY) {
+  const dinoCenterX = dino.x + dino.w / 2;
+  const dinoCenterY = dino.y + dino.h / 2;
+  const distanceX = Math.abs(playerCenterX - dinoCenterX);
+  const distanceY = Math.abs(playerCenterY - dinoCenterY);
+  return distanceX <= reachX && distanceY <= reachY;
+}
+
+function cancelDinoPendingAttack(dino) {
+  dino.attackPending = false;
+  dino.attackWindup = 0;
+  dino.pounceStunPending = false;
+}
+
+function updateDinoAttackState(dino, dt, inRangeNow, onHit = null) {
+  if (dino.attackCooldown > 0) {
+    dino.attackCooldown = Math.max(0, dino.attackCooldown - dt);
+  }
+
+  const playerValidTarget = !player.dead && player.health > 0;
+  if (dino.attackPending) {
+    if (!playerValidTarget || !inRangeNow) {
+      cancelDinoPendingAttack(dino);
+      return false;
+    }
+    dino.attackWindup = Math.max(0, dino.attackWindup - dt);
+    if (dino.attackWindup > 0) {
+      return false;
+    }
+
+    dealDamageToPlayer(dino.attackDamage);
+    dino.attackCooldown = dino.attackInterval;
+    dino.attackPending = false;
+    dino.attackWindup = 0;
+    if (typeof onHit === "function") {
+      onHit();
+    }
+    return true;
+  }
+
+  if (playerValidTarget && inRangeNow && dino.attackCooldown <= 0) {
+    dino.attackPending = true;
+    dino.attackWindup = DINO_ATTACK_WINDUP_SECONDS;
+  }
+  return false;
+}
+
 function updateDinoRespawns(dt) {
   if (!zoneHasDinoSpawns()) return;
   for (const dino of dinosaurs) {
@@ -3306,18 +3497,8 @@ function updateDilophosaurs(dt) {
       patrolDinoHomeArea(dilo, dt);
     }
 
-    if (dilo.attackCooldown > 0) {
-      dilo.attackCooldown = Math.max(0, dilo.attackCooldown - dt);
-    }
-
-    const updatedDiloCenterX = dilo.x + dilo.w / 2;
-    const updatedDiloCenterY = dilo.y + dilo.h / 2;
-    const biteDistanceX = Math.abs(playerCenterX - updatedDiloCenterX);
-    const biteDistanceY = Math.abs(playerCenterY - updatedDiloCenterY);
-    if (biteDistanceX <= dilo.attackReachX && biteDistanceY <= dilo.attackReachY && dilo.attackCooldown <= 0 && player.health > 0) {
-      dealDamageToPlayer(dilo.attackDamage);
-      dilo.attackCooldown = dilo.attackInterval;
-    }
+    const inAttackRange = isPlayerInDinoAttackRange(dilo, playerCenterX, playerCenterY);
+    updateDinoAttackState(dilo, dt, inAttackRange);
 
     dilo.anim += dt * 9;
   }
@@ -3349,18 +3530,8 @@ function updateRaptors(dt) {
       patrolDinoHomeArea(raptor, dt);
     }
 
-    if (raptor.attackCooldown > 0) {
-      raptor.attackCooldown = Math.max(0, raptor.attackCooldown - dt);
-    }
-
-    const updatedRaptorCenterX = raptor.x + raptor.w / 2;
-    const updatedRaptorCenterY = raptor.y + raptor.h / 2;
-    const biteDistanceX = Math.abs(playerCenterX - updatedRaptorCenterX);
-    const biteDistanceY = Math.abs(playerCenterY - updatedRaptorCenterY);
-    if (biteDistanceX <= raptor.attackReachX && biteDistanceY <= raptor.attackReachY && raptor.attackCooldown <= 0 && player.health > 0) {
-      dealDamageToPlayer(raptor.attackDamage);
-      raptor.attackCooldown = raptor.attackInterval;
-    }
+    const inAttackRange = isPlayerInDinoAttackRange(raptor, playerCenterX, playerCenterY);
+    updateDinoAttackState(raptor, dt, inAttackRange);
 
     raptor.anim += dt * 9.6;
   }
@@ -3384,9 +3555,7 @@ function updateThylacoleos(dt) {
     if (thylacoleo.treePerched) {
       thylacoleo.x = thylacoleo.treePerchX;
       thylacoleo.y = thylacoleo.treePerchY;
-      if (thylacoleo.attackCooldown > 0) {
-        thylacoleo.attackCooldown = Math.max(0, thylacoleo.attackCooldown - dt);
-      }
+      updateDinoAttackState(thylacoleo, dt, false);
 
       const playerBelow = playerCenterY >= thylacoleoCenterY - 2;
       const closeUnderTree = horizontalDistance <= 62;
@@ -3413,18 +3582,24 @@ function updateThylacoleos(dt) {
 
       if (
         thylacoleo.pounceStunArmed &&
+        !thylacoleo.attackPending &&
+        thylacoleo.attackCooldown <= 0 &&
         !player.dead &&
         player.health > 0 &&
         overlaps(thylacoleo, player)
       ) {
-        dealDamageToPlayer(thylacoleo.attackDamage);
-        thylacoleo.attackCooldown = thylacoleo.attackInterval;
+        thylacoleo.attackPending = true;
+        thylacoleo.attackWindup = DINO_ATTACK_WINDUP_SECONDS;
+        thylacoleo.pounceStunPending = true;
         thylacoleo.pounceStunArmed = false;
-        player.stunTimer = Math.max(player.stunTimer, THYLACOLEO_POUNCE_STUN_SECONDS);
       }
-      if (thylacoleo.attackCooldown > 0) {
-        thylacoleo.attackCooldown = Math.max(0, thylacoleo.attackCooldown - dt);
-      }
+      const pounceInRange = overlaps(thylacoleo, player);
+      updateDinoAttackState(thylacoleo, dt, pounceInRange, () => {
+        if (thylacoleo.pounceStunPending) {
+          player.stunTimer = Math.max(player.stunTimer, THYLACOLEO_POUNCE_STUN_SECONDS);
+          thylacoleo.pounceStunPending = false;
+        }
+      });
       thylacoleo.anim += dt * 9.4;
       continue;
     }
@@ -3440,18 +3615,13 @@ function updateThylacoleos(dt) {
       patrolDinoHomeArea(thylacoleo, dt);
     }
 
-    if (thylacoleo.attackCooldown > 0) {
-      thylacoleo.attackCooldown = Math.max(0, thylacoleo.attackCooldown - dt);
-    }
-
-    const updatedCenterX = thylacoleo.x + thylacoleo.w / 2;
-    const updatedCenterY = thylacoleo.y + thylacoleo.h / 2;
-    const biteDistanceX = Math.abs(playerCenterX - updatedCenterX);
-    const biteDistanceY = Math.abs(playerCenterY - updatedCenterY);
-    if (biteDistanceX <= thylacoleo.attackReachX && biteDistanceY <= thylacoleo.attackReachY && thylacoleo.attackCooldown <= 0 && player.health > 0) {
-      dealDamageToPlayer(thylacoleo.attackDamage);
-      thylacoleo.attackCooldown = thylacoleo.attackInterval;
-    }
+    const inAttackRange = isPlayerInDinoAttackRange(thylacoleo, playerCenterX, playerCenterY);
+    updateDinoAttackState(thylacoleo, dt, inAttackRange, () => {
+      if (thylacoleo.pounceStunPending) {
+        player.stunTimer = Math.max(player.stunTimer, THYLACOLEO_POUNCE_STUN_SECONDS);
+        thylacoleo.pounceStunPending = false;
+      }
+    });
 
     thylacoleo.anim += dt * 10.2;
   }
@@ -3483,18 +3653,8 @@ function updateTrexes(dt) {
       patrolDinoHomeArea(trex, dt, 0.9, 1.1);
     }
 
-    if (trex.attackCooldown > 0) {
-      trex.attackCooldown = Math.max(0, trex.attackCooldown - dt);
-    }
-
-    const updatedTrexCenterX = trex.x + trex.w / 2;
-    const updatedTrexCenterY = trex.y + trex.h / 2;
-    const biteDistanceX = Math.abs(playerCenterX - updatedTrexCenterX);
-    const biteDistanceY = Math.abs(playerCenterY - updatedTrexCenterY);
-    if (biteDistanceX <= trex.attackReachX && biteDistanceY <= trex.attackReachY && trex.attackCooldown <= 0 && player.health > 0) {
-      dealDamageToPlayer(trex.attackDamage);
-      trex.attackCooldown = trex.attackInterval;
-    }
+    const inAttackRange = isPlayerInDinoAttackRange(trex, playerCenterX, playerCenterY);
+    updateDinoAttackState(trex, dt, inAttackRange);
 
     trex.anim += dt * 6.3;
   }
@@ -3504,10 +3664,6 @@ function updateTriceratops(dt) {
   if (!zoneHasDinoSpawns()) return;
   for (const trike of dinosaurs) {
     if (!trike.alive || trike.type !== "trike") continue;
-
-    if (trike.attackCooldown > 0) {
-      trike.attackCooldown = Math.max(0, trike.attackCooldown - dt);
-    }
     if (trike.aggroTimer > 0) {
       trike.aggroTimer = Math.max(0, trike.aggroTimer - dt);
     }
@@ -3530,15 +3686,8 @@ function updateTriceratops(dt) {
       patrolDinoHomeArea(trike, dt);
     }
 
-    if (trike.aggroTimer > 0 && !player.dead && player.health > 0) {
-      const updatedTrikeCenterX = trike.x + trike.w / 2;
-      const biteDistanceX = Math.abs(playerCenterX - updatedTrikeCenterX);
-      const biteDistanceY = Math.abs(playerCenterY - trikeCenterY);
-      if (biteDistanceX <= trike.attackReachX && biteDistanceY <= trike.attackReachY && trike.attackCooldown <= 0) {
-        dealDamageToPlayer(trike.attackDamage);
-        trike.attackCooldown = trike.attackInterval;
-      }
-    }
+    const inAttackRange = trike.aggroTimer > 0 && isPlayerInDinoAttackRange(trike, playerCenterX, playerCenterY);
+    updateDinoAttackState(trike, dt, inAttackRange);
 
     trike.anim += dt * 6.6;
   }
@@ -5513,8 +5662,9 @@ function drawMainMenu() {
     ctx.fillText("Choose your game mode", panelX + panelW / 2, panelY + 98);
   } else if (mainMenuScreen === MENU_MULTIPLAYER) {
     ctx.fillText("Multiplayer", panelX + panelW / 2, panelY + 98);
-  } else {
-    ctx.fillText("Single Player Worlds", panelX + panelW / 2, panelY + 98);
+  } else if (mainMenuScreen === MENU_SINGLEPLAYER) {
+    const singleplayerTitle = worldMenuMode === WORLD_MENU_HOST ? "Choose A World To Host" : "Single Player Worlds";
+    ctx.fillText(singleplayerTitle, panelX + panelW / 2, panelY + 98);
   }
 
   const accountButton = {
@@ -5735,7 +5885,8 @@ function drawMainMenu() {
 
     ctx.fillStyle = "#5a3b1f";
     ctx.font = "18px Trebuchet MS, Segoe UI, sans-serif";
-    ctx.fillText("World Saves", panelX + panelW / 2, panelY + 314);
+    const worldListTitle = worldMenuMode === WORLD_MENU_HOST ? "Worlds To Host" : "World Saves";
+    ctx.fillText(worldListTitle, panelX + panelW / 2, panelY + 314);
 
     if (worldSaves.length > 0 && !worldSaves.some((world) => world.id === selectedWorldId)) {
       selectedWorldId = worldSaves[0].id;
