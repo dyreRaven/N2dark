@@ -66,12 +66,16 @@ const MAX_WORLD_LIST_BUTTONS = 4;
 const MENU_HOME = "home";
 const MENU_MODE = "mode";
 const MENU_SINGLEPLAYER = "singleplayer";
+const MENU_MULTIPLAYER = "multiplayer";
+const MULTIPLAYER_INVITE_CODE_LENGTH = 6;
 let mainMenuScreen = MENU_HOME;
 let worldListScroll = 0;
 const MULTIPLAYER_LAST_SERVER_KEY = "ark2d_last_multiplayer_server";
 const MULTIPLAYER_SEND_INTERVAL = 0.1;
 const MULTIPLAYER_SAVE_INTERVAL = 3;
 let guestProfile = null;
+let multiplayerInviteInput = "";
+let multiplayerInviteFocused = false;
 
 const inputState = {
   hotbarSlotRects: [],
@@ -87,7 +91,10 @@ const inputState = {
     worldDeleteButtons: [],
     worldListPanel: null,
     worldScrollUpButton: null,
-    worldScrollDownButton: null
+    worldScrollDownButton: null,
+    multiplayerInviteField: null,
+    multiplayerJoinButton: null,
+    multiplayerHostButton: null
   },
   mapUi: {
     panel: null,
@@ -97,7 +104,8 @@ const inputState = {
   },
   pauseMenu: {
     panel: null,
-    returnButton: null
+    returnButton: null,
+    hostWorldButton: null
   },
   respawnMenu: {
     panel: null,
@@ -1293,38 +1301,33 @@ function beginMultiplayerConnection(mode, serverUrl, worldId, worldName) {
   });
 }
 
-function beginMultiplayerFlow() {
+function getSanitizedInviteCode(rawValue) {
+  if (typeof rawValue !== "string") return "";
+  return rawValue
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, MULTIPLAYER_INVITE_CODE_LENGTH);
+}
+
+function openMultiplayerMenu() {
   if (!isGoogleSignedIn()) {
     setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
     return;
   }
+  mainMenuScreen = MENU_MULTIPLAYER;
+  multiplayerInviteInput = getSanitizedInviteCode(multiplayerWorldId || multiplayerInviteInput);
+  multiplayerInviteFocused = true;
+}
 
-  const modeInput = prompt("Multiplayer: type host or join.", "host");
-  if (!modeInput) return;
-  const mode = modeInput.trim().toLowerCase();
-  if (mode !== "host" && mode !== "join") {
-    setMenuStatus("Use host or join.");
+function joinMultiplayerFromInviteInput() {
+  if (!isGoogleSignedIn()) {
+    setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
     return;
   }
-
-  if (mode === "host") {
-    const worldNameInput = prompt("World name:", `World ${worldSaves.length + 1}`);
-    if (worldNameInput === null) return;
-    const worldName = normalizeWorldName(worldNameInput, worldSaves.length);
-    const candidates = getMultiplayerServerCandidates();
-    if (candidates.length === 0) {
-      setMenuStatus("No multiplayer server URL available.");
-      return;
-    }
-    beginMultiplayerConnection("host", candidates[0], "", worldName);
-    return;
-  }
-
-  const worldIdInput = prompt("Invite code to join:", multiplayerWorldId || "");
-  if (!worldIdInput) return;
-  const worldId = worldIdInput.trim().toUpperCase();
-  if (!/^[A-Z0-9]{6}$/.test(worldId)) {
-    setMenuStatus("Invite code must be 6 letters/numbers.");
+  const worldId = getSanitizedInviteCode(multiplayerInviteInput);
+  multiplayerInviteInput = worldId;
+  if (worldId.length !== MULTIPLAYER_INVITE_CODE_LENGTH) {
+    setMenuStatus(`Invite code must be ${MULTIPLAYER_INVITE_CODE_LENGTH} letters/numbers.`);
     return;
   }
   const candidates = getMultiplayerServerCandidates();
@@ -1333,6 +1336,58 @@ function beginMultiplayerFlow() {
     return;
   }
   beginMultiplayerConnection("join", candidates[0], worldId, "");
+}
+
+function hostMultiplayerFromMenu() {
+  if (!isGoogleSignedIn()) {
+    setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
+    return;
+  }
+  const candidates = getMultiplayerServerCandidates();
+  if (candidates.length === 0) {
+    setMenuStatus("No multiplayer server URL available.");
+    return;
+  }
+  const worldName = normalizeWorldName(`World ${worldSaves.length + 1}`, worldSaves.length);
+  beginMultiplayerConnection("host", candidates[0], "", worldName);
+}
+
+function hostCurrentWorldFromGame() {
+  if (isMultiplayerGame) {
+    if (multiplayerWorldId) {
+      try {
+        alert(`Invite code: ${multiplayerWorldId}\nShare this code so friends can join.`);
+      } catch {
+        // Ignore alert failures.
+      }
+    }
+    return;
+  }
+  if (!isGoogleSignedIn()) {
+    try {
+      alert("Google sign-in is required to host multiplayer.");
+    } catch {
+      // Ignore alert failures.
+    }
+    return;
+  }
+
+  const candidates = getMultiplayerServerCandidates();
+  if (candidates.length === 0) {
+    try {
+      alert("No multiplayer server URL available.");
+    } catch {
+      // Ignore alert failures.
+    }
+    return;
+  }
+
+  const activeWorld = getWorldById(activeWorldId || selectedWorldId);
+  const worldName = normalizeWorldName(
+    activeWorld?.name || `World ${worldSaves.length + 1}`,
+    worldSaves.length
+  );
+  beginMultiplayerConnection("host", candidates[0], "", worldName);
 }
 
 const DEFAULT_TREE_XS = [188, 472, 739, 1096, 1418, 1763, 2311];
@@ -1863,14 +1918,44 @@ function resetAllDinosaurs() {
   activateZoneDinosaurs(currentZone);
 }
 
+function handleMultiplayerMenuKeyInput(event) {
+  if (mainMenuScreen !== MENU_MULTIPLAYER) return false;
+  const code = event.code;
+  const key = typeof event.key === "string" ? event.key : "";
+
+  if (code === "Escape") {
+    mainMenuScreen = MENU_MODE;
+    multiplayerInviteFocused = false;
+    return true;
+  }
+  if (code === "Enter") {
+    joinMultiplayerFromInviteInput();
+    return true;
+  }
+  if (code === "Backspace") {
+    if (multiplayerInviteFocused && multiplayerInviteInput.length > 0) {
+      multiplayerInviteInput = multiplayerInviteInput.slice(0, -1);
+    }
+    return true;
+  }
+
+  if (!multiplayerInviteFocused || key.length !== 1) return false;
+  const upper = key.toUpperCase();
+  if (!/^[A-Z0-9]$/.test(upper)) return false;
+  if (multiplayerInviteInput.length >= MULTIPLAYER_INVITE_CODE_LENGTH) return true;
+  multiplayerInviteInput += upper;
+  return true;
+}
+
 let cameraX = 0;
 let lastTime = performance.now();
 
 window.addEventListener("keydown", (event) => {
   const code = event.code;
-  const handledKeys = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "KeyE", "KeyF", "KeyC", "KeyM", "KeyR", "Escape", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Numpad1", "Numpad2", "Slash"];
+  const handledKeys = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "KeyE", "KeyF", "KeyC", "KeyM", "KeyR", "Escape", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Numpad1", "Numpad2", "Slash", "Enter", "Backspace"];
   if (!gameStarted) {
-    if (handledKeys.includes(code)) {
+    const consumedByMultiplayerMenu = handleMultiplayerMenuKeyInput(event);
+    if (consumedByMultiplayerMenu || handledKeys.includes(code)) {
       event.preventDefault();
     }
     return;
@@ -2343,6 +2428,10 @@ function returnToTitleScreen() {
 }
 
 function handlePauseMenuClick(mouseX, mouseY) {
+  if (pointInRect(mouseX, mouseY, inputState.pauseMenu.hostWorldButton)) {
+    hostCurrentWorldFromGame();
+    return;
+  }
   if (pointInRect(mouseX, mouseY, inputState.pauseMenu.returnButton)) {
     returnToTitleScreen();
   }
@@ -2371,13 +2460,37 @@ function handleMainMenuClick(mouseX, mouseY) {
         setMenuStatus("Multiplayer requires Google sign-in. Click Google first.");
         return;
       }
-      beginMultiplayerFlow();
+      openMultiplayerMenu();
       return;
     }
     if (pointInRect(mouseX, mouseY, inputState.mainMenu.backButton)) {
       mainMenuScreen = MENU_HOME;
       return;
     }
+    return;
+  }
+
+  if (mainMenuScreen === MENU_MULTIPLAYER) {
+    if (pointInRect(mouseX, mouseY, inputState.mainMenu.multiplayerInviteField)) {
+      multiplayerInviteFocused = true;
+      return;
+    }
+    if (pointInRect(mouseX, mouseY, inputState.mainMenu.multiplayerJoinButton)) {
+      multiplayerInviteFocused = true;
+      joinMultiplayerFromInviteInput();
+      return;
+    }
+    if (pointInRect(mouseX, mouseY, inputState.mainMenu.multiplayerHostButton)) {
+      multiplayerInviteFocused = false;
+      hostMultiplayerFromMenu();
+      return;
+    }
+    if (pointInRect(mouseX, mouseY, inputState.mainMenu.backButton)) {
+      mainMenuScreen = MENU_MODE;
+      multiplayerInviteFocused = false;
+      return;
+    }
+    multiplayerInviteFocused = false;
     return;
   }
 
@@ -4095,24 +4208,6 @@ function drawRedwoodsBackground() {
   drawCloud(470 - cameraX * 0.025, 126, 0.84);
   drawCloud(830 - cameraX * 0.035, 86, 1.08);
 
-  const canopyShade = ctx.createLinearGradient(0, 0, 0, 180);
-  canopyShade.addColorStop(0, "rgba(35, 68, 49, 0.75)");
-  canopyShade.addColorStop(1, "rgba(35, 68, 49, 0)");
-  ctx.fillStyle = canopyShade;
-  ctx.fillRect(0, 0, VIEW_WIDTH, 200);
-
-  for (let i = 0; i < 18; i++) {
-    const canopyWorldX = i * 150 + 40;
-    const sx = canopyWorldX - cameraX * 0.22;
-    if (sx < -120 || sx > VIEW_WIDTH + 120) continue;
-    const canopyY = 90 + Math.sin((canopyWorldX + cameraX) * 0.004) * 8;
-    ctx.fillStyle = "#376b42";
-    ctx.beginPath();
-    ctx.ellipse(sx, canopyY, 90, 28, 0, 0, Math.PI * 2);
-    ctx.ellipse(sx + 36, canopyY + 12, 65, 24, 0, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
   const haze = ctx.createLinearGradient(0, 180, 0, 470);
   haze.addColorStop(0, "rgba(244, 241, 218, 0.08)");
   haze.addColorStop(1, "rgba(244, 241, 218, 0.58)");
@@ -5385,6 +5480,9 @@ function drawMainMenu() {
   inputState.mainMenu.worldListPanel = null;
   inputState.mainMenu.worldScrollUpButton = null;
   inputState.mainMenu.worldScrollDownButton = null;
+  inputState.mainMenu.multiplayerInviteField = null;
+  inputState.mainMenu.multiplayerJoinButton = null;
+  inputState.mainMenu.multiplayerHostButton = null;
   if (!googleAuthReady && hasGoogleClientId()) {
     tryInitGoogleAuth();
   }
@@ -5413,6 +5511,8 @@ function drawMainMenu() {
     ctx.fillText("Click Play to start. Google sign-in is optional.", panelX + panelW / 2, panelY + 98);
   } else if (mainMenuScreen === MENU_MODE) {
     ctx.fillText("Choose your game mode", panelX + panelW / 2, panelY + 98);
+  } else if (mainMenuScreen === MENU_MULTIPLAYER) {
+    ctx.fillText("Multiplayer", panelX + panelW / 2, panelY + 98);
   } else {
     ctx.fillText("Single Player Worlds", panelX + panelW / 2, panelY + 98);
   }
@@ -5525,6 +5625,80 @@ function drawMainMenu() {
       ctx.font = "12px Trebuchet MS, Segoe UI, sans-serif";
       ctx.fillText("Host creates an invite code. Join needs that code.", multiButton.x + multiButton.w / 2, multiButton.y + 74);
     }
+
+    ctx.fillStyle = "rgba(118, 86, 59, 0.92)";
+    ctx.fillRect(backButton.x, backButton.y, backButton.w, backButton.h);
+    ctx.strokeStyle = "#fff4de";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(backButton.x, backButton.y, backButton.w, backButton.h);
+    ctx.fillStyle = "#fff4de";
+    ctx.font = "22px Trebuchet MS, Segoe UI, sans-serif";
+    ctx.fillText("Back", backButton.x + backButton.w / 2, backButton.y + 31);
+  } else if (mainMenuScreen === MENU_MULTIPLAYER) {
+    const inviteField = {
+      x: panelX + panelW / 2 - 180,
+      y: panelY + 268,
+      w: 360,
+      h: 54
+    };
+    const joinButton = {
+      x: panelX + panelW / 2 - 180,
+      y: panelY + 336,
+      w: 170,
+      h: 54
+    };
+    const hostButton = {
+      x: panelX + panelW / 2 + 10,
+      y: panelY + 336,
+      w: 170,
+      h: 54
+    };
+    const backButton = {
+      x: panelX + panelW - 74 - 120,
+      y: panelY + 124,
+      w: 120,
+      h: 46
+    };
+    inputState.mainMenu.multiplayerInviteField = inviteField;
+    inputState.mainMenu.multiplayerJoinButton = joinButton;
+    inputState.mainMenu.multiplayerHostButton = hostButton;
+    inputState.mainMenu.backButton = backButton;
+
+    ctx.fillStyle = "#5a3b1f";
+    ctx.font = "15px Trebuchet MS, Segoe UI, sans-serif";
+    ctx.fillText("Enter invite code to join", panelX + panelW / 2, panelY + 246);
+
+    ctx.fillStyle = multiplayerInviteFocused ? "rgba(255, 235, 188, 0.96)" : "rgba(235, 221, 192, 0.92)";
+    ctx.fillRect(inviteField.x, inviteField.y, inviteField.w, inviteField.h);
+    ctx.strokeStyle = multiplayerInviteFocused ? "#b57c2e" : "#9f7e55";
+    ctx.lineWidth = multiplayerInviteFocused ? 3 : 2;
+    ctx.strokeRect(inviteField.x, inviteField.y, inviteField.w, inviteField.h);
+    ctx.fillStyle = "#5a3b1f";
+    ctx.font = "30px Trebuchet MS, Segoe UI, sans-serif";
+    const inviteDisplay = multiplayerInviteInput || "------";
+    ctx.fillText(inviteDisplay, inviteField.x + inviteField.w / 2, inviteField.y + 37);
+    if (multiplayerInviteFocused) {
+      ctx.font = "11px Trebuchet MS, Segoe UI, sans-serif";
+      ctx.fillText("Type letters/numbers then press Enter", inviteField.x + inviteField.w / 2, inviteField.y + 50);
+    }
+
+    ctx.fillStyle = "rgba(72, 124, 176, 0.95)";
+    ctx.fillRect(joinButton.x, joinButton.y, joinButton.w, joinButton.h);
+    ctx.strokeStyle = "#fff4de";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(joinButton.x, joinButton.y, joinButton.w, joinButton.h);
+    ctx.fillStyle = "#fff4de";
+    ctx.font = "24px Trebuchet MS, Segoe UI, sans-serif";
+    ctx.fillText("Join", joinButton.x + joinButton.w / 2, joinButton.y + 36);
+
+    ctx.fillStyle = "rgba(73, 126, 78, 0.95)";
+    ctx.fillRect(hostButton.x, hostButton.y, hostButton.w, hostButton.h);
+    ctx.strokeStyle = "#fff4de";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(hostButton.x, hostButton.y, hostButton.w, hostButton.h);
+    ctx.fillStyle = "#fff4de";
+    ctx.font = "22px Trebuchet MS, Segoe UI, sans-serif";
+    ctx.fillText("Host World", hostButton.x + hostButton.w / 2, hostButton.y + 35);
 
     ctx.fillStyle = "rgba(118, 86, 59, 0.92)";
     ctx.fillRect(backButton.x, backButton.y, backButton.w, backButton.h);
@@ -5697,10 +5871,11 @@ function drawPauseMenu() {
   const ui = inputState.pauseMenu;
   ui.panel = null;
   ui.returnButton = null;
+  ui.hostWorldButton = null;
   if (!pauseMenuOpen) return;
 
   const panelW = 420;
-  const panelH = 220;
+  const panelH = 300;
   const panelX = (VIEW_WIDTH - panelW) / 2;
   const panelY = (VIEW_HEIGHT - panelH) / 2;
   ui.panel = { x: panelX, y: panelY, w: panelW, h: panelH };
@@ -5721,9 +5896,32 @@ function drawPauseMenu() {
   ctx.font = "14px Trebuchet MS, Segoe UI, sans-serif";
   ctx.fillText("Press Esc to continue", panelX + panelW / 2, panelY + 90);
 
+  const hostButton = {
+    x: panelX + 62,
+    y: panelY + 118,
+    w: panelW - 124,
+    h: 58
+  };
+  ui.hostWorldButton = hostButton;
+  const hostAvailable = isMultiplayerGame || isGoogleSignedIn();
+  ctx.fillStyle = hostAvailable ? "rgba(73, 126, 78, 0.95)" : "rgba(109, 109, 109, 0.72)";
+  ctx.fillRect(hostButton.x, hostButton.y, hostButton.w, hostButton.h);
+  ctx.strokeStyle = "#fff4de";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(hostButton.x, hostButton.y, hostButton.w, hostButton.h);
+  ctx.fillStyle = "#fff4de";
+  ctx.font = "22px Trebuchet MS, Segoe UI, sans-serif";
+  const hostLabel = isMultiplayerGame ? "Show Invite Code" : "Host Current World";
+  ctx.fillText(hostLabel, hostButton.x + hostButton.w / 2, hostButton.y + 37);
+  if (!hostAvailable) {
+    ctx.fillStyle = "#6d2f1d";
+    ctx.font = "12px Trebuchet MS, Segoe UI, sans-serif";
+    ctx.fillText("Sign in with Google to host multiplayer", panelX + panelW / 2, hostButton.y + 76);
+  }
+
   const returnButton = {
     x: panelX + 62,
-    y: panelY + 122,
+    y: panelY + 204,
     w: panelW - 124,
     h: 58
   };
